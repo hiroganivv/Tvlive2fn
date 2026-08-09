@@ -92,6 +92,8 @@ pub struct ProxyContext {
     // 上游无视 Accept-Encoding 仍返回压缩体（gzip 等）时为 true：文本改写会损坏数据，
     // 需跳过改写、原样透传，让播放器自行解压
     skip_rewrite: bool,
+    // 连接失败自动重试计数（fail_to_connect 中使用，限制重试次数防止无限重试）
+    retry_count: u8,
 }
 
 impl ProxyContext {
@@ -106,6 +108,7 @@ impl ProxyContext {
             pending_tag: None,
             proxy_base: None,
             skip_rewrite: false,
+            retry_count: 0,
         }
     }
 }
@@ -298,13 +301,36 @@ impl ProxyHttp for IptvProxy {
         ProxyContext::new()
     }
 
-    // 上游连接失败/超时（连接建立、TLS 握手、无响应等）时自动重试 1 次。
+    // 上游连接建立失败（ConnectError / ConnectTimedout）时自动重试 1 次：
+    // 对可重试的错误调用 Error::set_retry(true)，pingora 会重新调用 upstream_peer() 再连一次。
     // 代理的请求全部是幂等 GET（m3u8 / TS 分片 / 密钥），重试安全。
     // 播放器请求分片时常因上游首次握手慢而超时 abort（表现为日志里的
     // Downstream ConnectionClosed、以及"要多次点击播放才能播"），
     // 由代理自行重试后，播放器无需再手动重连。
-    fn retries(&self, _ctx: &Self::CTX) -> usize {
-        1
+    // 同时清除该域名 DNS 缓存，让重试时重新解析（避免失效 IP 被缓存 5 分钟反复失败）。
+    fn fail_to_connect(
+        &self,
+        _session: &mut Session,
+        _peer: &HttpPeer,
+        ctx: &mut Self::CTX,
+        mut e: Box<Error>,
+    ) -> Box<Error> {
+        let retryable = matches!(e.etype, ErrorType::ConnectError | ErrorType::ConnectTimedout);
+        if retryable && ctx.retry_count < 1 {
+            // 清除 DNS 缓存，重试时重新解析，换一个可用 IP
+            if let Some(host) = ctx.target_url.as_ref().and_then(|u| u.host_str()) {
+                if let Some(cache) = DNS_CACHE.get() {
+                    if let Ok(mut g) = cache.lock() {
+                        if g.remove(host).is_some() {
+                            debug!("DNS cache invalidated for {host} (fail_to_connect)");
+                        }
+                    }
+                }
+            }
+            ctx.retry_count += 1;
+            e.set_retry(true);
+        }
+        e
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
@@ -424,7 +450,7 @@ impl ProxyHttp for IptvProxy {
         let mut peer = HttpPeer::new(addr, is_https, host.clone());
         // 上游连接调优（针对播放器"请求分片时提前断开 / 需多次点击才能播放"问题）：
         // - connection_timeout / total_connection_timeout 收紧：上游慢时快速失败，
-        //   配合下方 retries() 自动重试，让代理在播放器超时 abort 之前就完成连接或失败重试，
+        //   配合下方 fail_to_connect 自动重试，让代理在播放器超时 abort 之前就完成连接或失败重试，
         //   避免播放器干等后主动 RST（即日志里的 Downstream ConnectionClosed）。
         // - idle_timeout 拉长：让建好的 TLS 连接在连接池里多活一会儿，减少 web 播放器
         //   频繁 abort / 并发取段时反复做 TLS 握手（~0.5-1s）造成的卡顿。
@@ -625,8 +651,9 @@ impl ProxyHttp for IptvProxy {
         if let Some(err) = e {
             // 上游连接建立失败/超时：立即清除对应 DNS 缓存条目，下次重试会重新解析，
             // 避免一个失效 IP 被缓存 5 分钟导致同一分片反复连接失败（"多次点击才播得出来"）。
+            // 注：pingora 的 ErrorType 拼写为 ConnectTimedout。
             if err.esource == ErrorSource::Upstream
-                && matches!(err.etype, ErrorType::ConnectError | ErrorType::ConnectTimeout)
+                && matches!(err.etype, ErrorType::ConnectError | ErrorType::ConnectTimedout)
             {
                 if let Some(host) = ctx.target_url.as_ref().and_then(|u| u.host_str()) {
                     if let Some(cache) = DNS_CACHE.get() {
