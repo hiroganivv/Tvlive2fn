@@ -84,6 +84,7 @@ start_service() {
     procd_set_param env BIND_ADDR="0.0.0.0:8080"
     procd_set_param env RUST_LOG="info"
     procd_set_param env WORKERS="4"
+    procd_set_param env LOG_FILE="/tmp/iptv-proxy.log"
     procd_set_param respawn 3600 5 5
     procd_set_param stdout 1
     procd_set_param stderr 1
@@ -136,7 +137,7 @@ curl -s "http://${TARGET_HOST}:8080/health" && echo "" && echo "✅ Health check
 
 echo ""
 echo "测试m3u8代理..."
-curl -s --max-time 10 "http://${TARGET_HOST}:8080/iptv/http://116.199.7.27:8006/00000000/1d77ac8593854801b7503a85270ee7b9/index.m3u8" | head -5 && echo "✅ M3U8 proxy OK" || echo "⚠️  M3U8 test timeout (may need real stream)"
+curl -s --max-time 10 "http://${TARGET_HOST}:8080/?url=http%3A%2F%2F116.199.7.27%3A8006%2F00000000%2F1d77ac8593854801b7503a85270ee7b9%2Findex.m3u8" | head -5 && echo "✅ M3U8 proxy OK" || echo "⚠️  M3U8 test timeout (may need real stream)"
 
 echo ""
 echo "========================================="
@@ -149,10 +150,11 @@ echo "  Stop:    /etc/init.d/iptv-proxy stop"
 echo "  Restart: /etc/init.d/iptv-proxy restart"
 echo "  Status:  /etc/init.d/iptv-proxy status"
 echo "  Logs:    logread -f | grep iptv-proxy"
+echo "           tail -f /tmp/iptv-proxy.log   (文件日志，守护模式可用)"
 echo ""
 echo "Usage:"
-echo "  http://${TARGET_HOST}:8080/iptv/http://116.199.x.x/path/file.m3u8"
-echo "  http://${TARGET_HOST}:8080/iptv/https://surrit.com/path/file.m3u8"
+echo "  http://${TARGET_HOST}:8080/?url=<percent-encoded 目标URL>"
+echo "  例: curl \"http://${TARGET_HOST}:8080/?url=http%3A%2F%2F116.199.x.x%2Fpath%2Ffile.m3u8\""
 echo ""
 echo "Performance:"
 echo "  Workers: 4 (auto-detect CPU cores)"

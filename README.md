@@ -85,41 +85,49 @@ chmod +x /usr/bin/iptv-proxy
 
 ## 🎬 使用方法
 
-### URL格式
+### URL格式（统一 `/?url=` 模式）
+
+所有目标地址通过 `url` 查询参数传入（需要 URL 编码）：
 
 ```bash
-# 116.199 IPTV (自动改写m3u8)
-http://192.168.1.3:8080/iptv/http://116.199.7.27:8006/00000000/xxx/index.m3u8
+# 任意 IPTV 源（m3u8 自动改写，分片也走本代理）
+curl "http://192.168.1.3:8080/?url=http%3A%2F%2F116.199.7.27%3A8006%2F00000000%2Fxxx%2Findex.m3u8"
 
-# surrit.com (自动添加Referer)
-http://192.168.1.3:8080/iptv/https://surrit.com/path/file.m3u8
+# surrit.com / fourhoi.com 等（自动注入 Referer）
+curl "http://192.168.1.3:8080/?url=https%3A%2F%2Fsurrit.com%2Fpath%2Ffile.m3u8"
 
-# fourhoi.com (自动添加Referer)
-http://192.168.1.3:8080/iptv/https://fourhoi.com/path/file.m3u8
+# 直接代理任意媒体文件（TS 分片等，零拷贝透传）
+curl "http://192.168.1.3:8080/?url=http%3A%2F%2F116.199.4.228%3A8114%2FLIVES%2Fsegment.ts"
 
-# TS片段 (自动透明代理，由m3u8改写生成)
-http://192.168.1.3:8080/proxy/116.199.4.228:8114/LIVES/segment.ts
+# 播放器里填：
+# http://192.168.1.3:8080/?url=http%3A%2F%2F116.199.7.27%3A8006%2Fxxx%2Findex.m3u8
 ```
+
+URL 编码可用任意工具生成：`python3 -c "import urllib.parse;print(urllib.parse.quote('http://116.199.7.27:8006/xxx/index.m3u8',safe=''))"`。
 
 ### m3u8改写示例
 
-**原始m3u8** (116.199.7.27返回):
+**原始m3u8** (上游返回):
 ```m3u8
 #EXTM3U
 #EXT-X-VERSION:3
 #EXTINF:10.0,
 http://116.199.4.228:8114/LIVES/segment001.ts
-http://116.199.4.228:8114/LIVES/segment002.ts
+#EXTINF:10.0,
+12345.ts
 ```
 
-**代理后** (192.168.1.3:8080返回):
+**代理后** (192.168.1.3:8080返回，所有分片被改写为代理地址):
 ```m3u8
 #EXTM3U
 #EXT-X-VERSION:3
 #EXTINF:10.0,
-http://192.168.1.3:8080/proxy/116.199.4.228:8114/LIVES/segment001.ts
-http://192.168.1.3:8080/proxy/116.199.4.228:8114/LIVES/segment002.ts
+http://192.168.1.3:8080/?url=http%3A%2F%2F116.199.4.228%3A8114%2FLIVES%2Fsegment001.ts
+#EXTINF:10.0,
+http://192.168.1.3:8080/?url=http%3A%2F%2F116.199.4.228%3A8114%2FLIVES%2F12345.ts
 ```
+
+支持相对路径、绝对路径、绝对 URL、查询参数分片，以及 `#EXT-X-KEY`（AES-128 密钥）、`#EXT-X-MAP`（fMP4 初始化段）等标签内引号 URI 的改写。
 
 ## 🔧 配置
 
@@ -132,7 +140,18 @@ LOCAL_IP="192.168.1.3"      # 本机IP（用于m3u8改写）
 BIND_ADDR="0.0.0.0:8080"    # 监听地址
 WORKERS="4"                  # 工作线程数（默认自动检测CPU核心数）
 RUST_LOG="info"              # 日志级别: error/warn/info/debug
+LOG_FILE="/tmp/iptv-proxy.log"  # 日志文件路径（默认 <临时目录>/iptv-proxy.log，OpenWrt 即 /tmp/iptv-proxy.log）
+ALLOW_HOSTS="surrit.com,fourhoi.com"  # 可选：上游域名白名单（逗号分隔，未设置时不做域名限制）
 ```
+
+### 日志
+
+- 日志**同时输出到 stderr 与日志文件**，服务以守护方式（无终端）启动时也能调试：
+  ```bash
+  tail -f /tmp/iptv-proxy.log
+  ```
+- 调试时把 `RUST_LOG` 设为 `debug`，可看到每次请求的解码 URL、上游连接、请求头、m3u8 改写明细。
+- 文件打开失败（如路径无权限）时自动降级为仅 stderr，不影响服务启动。
 
 ### 系统优化
 
@@ -207,20 +226,23 @@ LOCAL_IP=192.168.1.3 RUST_LOG=debug /usr/bin/iptv-proxy
 ### 404错误
 
 ```bash
-# 检查URL格式
-curl -v "http://192.168.1.3:8080/iptv/http://116.199.7.27:8006/test.m3u8"
+# 检查URL格式（必须是 /?url=<编码后的目标>）
+curl -v "http://192.168.1.3:8080/?url=http%3A%2F%2F116.199.7.27%3A8006%2Ftest.m3u8"
 
-# 应该看到upstream_peer日志
+# 应该看到 Decoded URL / Upstream 日志
 logread | grep "IPTV:"
+tail -f /tmp/iptv-proxy.log
 ```
 
-### m3u8未改写
+### 播放1秒就中断 / 有声音无画面
+
+多为 m3u8 改写漏改导致部分分片没走代理。用 `RUST_LOG=debug` 重启后看 `/tmp/iptv-proxy.log`：
 
 ```bash
-# 检查是否是116.199来源
-curl -s "http://192.168.1.3:8080/iptv/http://116.199.7.27:8006/xxx.m3u8"
+# 检查返回的 m3u8 中是否有未改写的裸地址（分片名应为 .../?url=http%3A... 形式）
+curl -s "http://192.168.1.3:8080/?url=http%3A%2F%2F116.199.7.27%3A8006%2Fxxx.m3u8"
 
-# 应该看到 "http://192.168.1.3:8080/proxy/116.199."
+# 若分片 URL 形如 http://116.199.x.x/... 裸地址，说明该源未被改写
 ```
 
 ### 高并发下崩溃
