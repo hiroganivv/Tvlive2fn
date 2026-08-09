@@ -261,7 +261,7 @@ impl ProxyHttp for IptvProxy {
         // 解析为 IPv4 优先地址，避免连 IPv6 上游超时（家庭网络常见），并带 DNS 缓存
         let addr = resolve_upstream_addr(&host, port).await?;
 
-        let mut peer = HttpPeer::new(addr, is_https, host);
+        let mut peer = HttpPeer::new(addr, is_https, host.clone());
         // 上游连接调优：
         // - idle_timeout 拉长：让建好的 TLS 连接在连接池里多活一会儿，减少 web 播放器
         //   频繁 abort / 并发取段时反复做 TLS 握手（~0.5-1s）造成的卡顿。
