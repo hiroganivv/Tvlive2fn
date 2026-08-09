@@ -97,16 +97,20 @@ pub struct ProxyContext {
     base_url: Option<String>,
     origin_base: Option<String>,
     needs_jpeg_fix: bool,
-    // 跨 chunk 字节缓冲：保证被 \n 截断的行 / 跨块的多字节 UTF-8 不会损坏
+
+    // 跨 chunk 缓冲
     byte_buf: Vec<u8>,
-    // 等待其后续 URI 行的标签（#EXTINF 等），跨 chunk 保持
+
+    // 等待 URI 的标签
     pending_tag: Option<String>,
-    // 预生成的代理前缀，避免每个 chunk 重复拼接
+
+    // 预生成代理前缀
     proxy_base: Option<String>,
-    // 上游无视 Accept-Encoding 仍返回压缩体（gzip 等）时为 true：文本改写会损坏数据，
-    // 需跳过改写、原样透传，让播放器自行解压
+
+    // 压缩响应跳过改写
     skip_rewrite: bool,
-    // 连接失败自动重试计数（fail_to_connect 中使用，限制重试次数防止无限重试）
+
+    // 连接失败重试计数
     retry_count: u8,
 }
 
@@ -150,25 +154,23 @@ impl IptvProxy {
     }
 
     fn is_likely_media_resource(line: &str) -> bool {
-        const MEDIA_EXTS: &[&str] = &[
-            ".ts", ".m3u8", ".m3u", ".mp4", ".m4s", ".m4a",
-            ".aac", ".mp3", ".ogg", ".opus", ".vtt", ".srt",
-            ".jpeg", ".jpg", ".png", ".key",
-        ];
-        // 绝对路径（/ 开头）一律按媒体处理，保证 m3u8 内所有相对 URI 都被代理
-        if line.starts_with('/') {
-            return true;
-        }
-        // 去掉查询参数后按扩展名判定。
-        // 注意：纯数字文件名（如 12345.ts / 00000000/12345.ts）在 IPTV 中非常常见，
-        // 此前"纯数字则跳过改写"会导致这些分片行被漏改、进而被丢弃，
-        // 播放器拿到残缺列表 → 播放 1 秒后中断。因此不再对文件名做数字特判。
-        let path = match line.find('?') {
-            Some(pos) => &line[..pos],
-            None => line,
-        };
-        MEDIA_EXTS.iter().any(|ext| path.ends_with(ext))
+    const MEDIA_EXTS: &[&str] = &[
+        ".ts", ".m3u8", ".m3u", ".mp4", ".m4s", ".m4a",
+        ".aac", ".mp3", ".ogg", ".opus", ".vtt", ".srt",
+        ".jpeg", ".jpg", ".png", ".key",
+    ];
+
+    if line.starts_with('/') {
+        return true;
     }
+
+    let path = match line.find('?') {
+        Some(pos) => &line[..pos],
+        None => line,
+    };
+
+    MEDIA_EXTS.iter().any(|ext| path.ends_with(ext))
+}
 
     fn tag_requires_uri(line: &str) -> bool {
         line.starts_with("#EXTINF:")
@@ -323,33 +325,41 @@ impl ProxyHttp for IptvProxy {
     // 配合上面的 Sticky DNS：重试时把该 host 的 sticky 下标切到下一个边缘节点（failover），
     // 从而绕开恰好死掉/被墙的 Cloudflare 边缘，显著减少"播放器超时断开 → 要多次点击才能播"。
     fn fail_to_connect(
-        &self,
-        _session: &mut Session,
-        _peer: &HttpPeer,
-        ctx: &mut Self::CTX,
-        mut e: Box<Error>,
-    ) -> Box<Error> {
-        if ctx.retry_count < 1 {
-            // 把该 host 的 sticky 下标切到下一个边缘，重试时 upstream_peer 会连到新 IP
-            if let Some(host) = ctx.target_url.as_ref().and_then(|u| u.host_str()) {
-                if let Some(cache) = DNS_CACHE.get() {
-                    if let Ok(mut g) = cache.write() {
-                        if let Some(entry) = g.get_mut(host) {
-                            if entry.addrs.len() > 1 {
-                                entry.idx = (entry.idx + 1) % entry.addrs.len();
-                                entry.ts = Instant::now(); // 重置 TTL，让新边缘稳定用一小会儿
-                                debug!("DNS failover: rotated {} to IP #{}", host, entry.idx);
-                            }
+    &self,
+    _session: &mut Session,
+    _peer: &HttpPeer,
+    ctx: &mut Self::CTX,
+    mut e: Box<Error>,
+) -> Box<Error> {
+    if ctx.retry_count < 1 {
+        // 切换 Cloudflare 边缘 IP
+        if let Some(host) = ctx.target_url.as_ref().and_then(|u| u.host_str()) {
+            if let Some(cache) = DNS_CACHE.get() {
+                if let Ok(mut g) = cache.write() {
+                    if let Some(entry) = g.get_mut(host) {
+                        if entry.addrs.len() > 1 {
+                            entry.idx = (entry.idx + 1) % entry.addrs.len();
+                            entry.ts = Instant::now();
+
+                            debug!(
+                                "DNS failover: rotated {} to IP #{}",
+                                host,
+                                entry.idx
+                            );
                         }
                     }
                 }
             }
-            ctx.retry_count += 1;
-            e.set_retry(true);
-            info!("Upstream connect failed, retrying ({e})");
         }
-        e
+
+        ctx.retry_count += 1;
+        e.set_retry(true);
+
+        info!("Upstream connect failed, retrying ({e})");
     }
+
+    e
+}
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
         let req = session.req_header();
@@ -430,10 +440,12 @@ impl ProxyHttp for IptvProxy {
 
             ctx.target_url = Some(url.clone());
             // 预生成代理前缀，整个请求只拼一次
-            ctx.proxy_base = Some(format!(
-                "http://{}:{}/?url=",
-                self.config.local_ip, self.config.bind_port
-            ));
+            // 预生成代理前缀
+ctx.proxy_base = Some(format!(
+    "http://{}:{}/?url=",
+    self.config.local_ip,
+    self.config.bind_port
+));
 
             let authority = url.authority().to_string();
             ctx.origin_base = Some(format!("{}://{}", url.scheme(), authority));
@@ -472,10 +484,11 @@ impl ProxyHttp for IptvProxy {
         // - idle_timeout 60s：建好的 TLS 连接留在连接池里多活一会儿，HLS 播放器并发取段时复用，
         //   省掉反复 TLS 握手（~0.5-1s）带来的卡顿；
         // - read_timeout 30s：TS 分片可能较大 / 上游偶发慢，放宽读超时避免被误判为断流。
-        peer.options.connection_timeout = Some(Duration::from_secs(3));
-        peer.options.total_connection_timeout = Some(Duration::from_secs(8));
-        peer.options.idle_timeout = Some(Duration::from_secs(60));
-        peer.options.read_timeout = Some(Duration::from_secs(30));
+        // OpenWrt + Cloudflare HLS 优化
+		peer.options.connection_timeout = Some(Duration::from_secs(3));       // TCP
+		peer.options.total_connection_timeout = Some(Duration::from_secs(8)); // TCP+TLS
+		peer.options.idle_timeout = Some(Duration::from_secs(60));            // 连接池复用
+		peer.options.read_timeout = Some(Duration::from_secs(30));            // TS 分片读取
 
         debug!("Upstream: {} ({}) TLS: {}", addr, host, is_https);
         Ok(Box::new(peer))
@@ -576,134 +589,158 @@ impl ProxyHttp for IptvProxy {
         }
 
         if ctx.is_m3u8 {
-            // 防御：上游可能无视我们移除 Accept-Encoding 仍返回 gzip 压缩体。
-            // 此时 body 是压缩字节流，按文本改写必然损坏播放列表 → 标记跳过改写、原样透传，
-            // 由播放器自行解压。
-            let enc = upstream_response
-                .headers
-                .get("content-encoding")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("identity");
-            if !enc.eq_ignore_ascii_case("identity") {
-                ctx.skip_rewrite = true;
-                return Ok(());
-            }
-            // 改写后内容长度必然变化，去掉 Content-Length 交给 pingora 重新分块
-            upstream_response.remove_header("Content-Length");
-        }
+    // 上游可能仍返回 gzip
+    let enc = upstream_response
+        .headers
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("identity");
+
+    if !enc.eq_ignore_ascii_case("identity") {
+        ctx.skip_rewrite = true;
+        return Ok(());
+    }
+
+    // 改写后长度会变化
+    upstream_response.remove_header("Content-Length");
+}
 
         Ok(())
     }
 
-    fn response_body_filter(&self, _session: &mut Session, body: &mut Option<Bytes>, end_of_stream: bool, ctx: &mut Self::CTX) -> Result<Option<Duration>> {
-        if !ctx.is_m3u8 || ctx.skip_rewrite {
-            return Ok(None);
-        }
+fn response_body_filter(
+    &self,
+    _session: &mut Session,
+    body: &mut Option<Bytes>,
+    end_of_stream: bool,
+    ctx: &mut Self::CTX,
+) -> Result<Option<Duration>> {
 
-        // 取出本块字节并累加到跨 chunk 缓冲
-        let chunk = body.take().unwrap_or_default();
-        ctx.byte_buf.extend_from_slice(&chunk);
-
-        // 还没凑齐任何完整行且流未结束：暂存，本轮不输出
-        if ctx.byte_buf.iter().rposition(|&b| b == b'\n').is_none() && !end_of_stream {
-            *body = None;
-            return Ok(None);
-        }
-
-        // 仅在 \n 字节边界切分（0x0A 不会出现在多字节 UTF-8 字符内部），
-        // 因此"完整部分"一定是合法 UTF-8，可被安全解码；剩余尾巴留到下一个 chunk。
-        let (mut complete, tail) = match ctx.byte_buf.iter().rposition(|&b| b == b'\n') {
-            Some(pos) => {
-                let end = pos + 1;
-                (ctx.byte_buf[..end].to_vec(), ctx.byte_buf[end..].to_vec())
-            }
-            None => (std::mem::take(&mut ctx.byte_buf), Vec::new()),
-        };
-        ctx.byte_buf = tail;
-
-        // 流结束时，缓冲里可能还剩"最后一行但没有 \n 结尾"的字节（很多 m3u8 的末行无换行）。
-        // 若不合并，最后一行分片会被永久吞掉 → 播放列表缺尾片。这里把它们补进本轮的完整行。
-        if end_of_stream && !ctx.byte_buf.is_empty() {
-            complete.extend_from_slice(&std::mem::take(&mut ctx.byte_buf));
-        }
-
-        if complete.is_empty() {
-            *body = None;
-            return Ok(None);
-        }
-
-        let content = match std::str::from_utf8(&complete) {
-            Ok(s) => s,
-            Err(_) => {
-                // 理论上不会触发（已在 \n 边界切分）；保险起见原样转发该块
-                *body = Some(Bytes::from(complete));
-                return Ok(None);
-            }
-        };
-
-        let base = ctx.base_url.as_ref().expect("base_url missing");
-        let origin_base = ctx.origin_base.as_ref().expect("origin_base missing");
-        let proxy_base = ctx.proxy_base.as_ref().expect("proxy_base missing");
-
-        let (new_content, new_pending) = Self::rewrite_m3u8_lines(
-            content,
-            base,
-            origin_base,
-            proxy_base,
-            end_of_stream,
-            ctx.pending_tag.take(),
-        );
-        if !end_of_stream {
-            ctx.pending_tag = new_pending;
-        }
-
-        debug!("M3U8 rewritten ({} bytes)", new_content.len());
-        *body = Some(Bytes::from(new_content));
-        Ok(None)
+    if !ctx.is_m3u8 || ctx.skip_rewrite {
+        return Ok(None);
     }
 
-    async fn logging(&self, session: &mut Session, e: Option<&Error>, ctx: &mut Self::CTX) {
-        let req = session.req_header();
-        let status = session.response_written().map(|r| r.status.as_u16()).unwrap_or(0);
-        let client = session.client_addr().map(|a| a.to_string()).unwrap_or_else(|| "unknown".into());
-        if let Some(err) = e {
-            // 上游连接建立失败/超时：立即清除对应 DNS 缓存条目，下次重试会重新解析，
-            // 避免一个失效 IP 被缓存 5 分钟导致同一分片反复连接失败（"多次点击才播得出来"）。
-            // 注：pingora 的 ErrorType 拼写为 ConnectTimedout。
-            if err.esource == ErrorSource::Upstream
-                && matches!(err.etype, ErrorType::ConnectError | ErrorType::ConnectTimedout)
-            {
-                if let Some(host) = ctx.target_url.as_ref().and_then(|u| u.host_str()) {
-                    if let Some(cache) = DNS_CACHE.get() {
-                        if let Ok(mut g) = cache.write() {
-                            if g.remove(host).is_some() {
-                                debug!("DNS cache invalidated for {host}");
-                            }
-                        }
-                    }
-                }
-            }
-            // 客户端主动断连（下游写入/读取失败、连接关闭）属正常现象（播放器停止、
-            // 读完列表即关连接、或客户端超时先 RST），降级为 debug 以免刷屏并误判为故障。
-            let client_abort = err.esource == ErrorSource::Downstream
-                && matches!(
-                    err.etype,
-                    ErrorType::WriteError | ErrorType::ReadError | ErrorType::ConnectionClosed
-                );
-            // 4xx 是客户端问题（非法请求 / 不在白名单的扫描器），并非服务故障，降级为 debug 避免刷屏
-            let client_error = matches!(err.etype, ErrorType::HTTPStatus(_));
-            if client_abort || client_error {
-                debug!(
-                    "{} {} {} - client-side (Status:{}): {}",
-                    client, req.method, req.uri.path(), status, err
-                );
-            } else {
-                error!("{} {} {} - Status:{} Error:{:?}", client, req.method, req.uri.path(), status, err);
-            }
+    let chunk = body.take().unwrap_or_default();
+    ctx.byte_buf.extend_from_slice(&chunk);
+
+    // 没有完整行且未结束
+    if ctx.byte_buf.iter().rposition(|&b| b == b'\n').is_none() && !end_of_stream {
+        *body = None;
+        return Ok(None);
+    }
+
+    let (mut complete, tail) = match ctx.byte_buf.iter().rposition(|&b| b == b'\n') {
+        Some(pos) => {
+            let end = pos + 1;
+            (
+                ctx.byte_buf[..end].to_vec(),
+                ctx.byte_buf[end..].to_vec(),
+            )
+        }
+        None => (std::mem::take(&mut ctx.byte_buf), Vec::new()),
+    };
+
+    ctx.byte_buf = tail;
+
+    // 修复：最后一行没有换行也不能丢
+    if end_of_stream && !ctx.byte_buf.is_empty() {
+        complete.extend_from_slice(&std::mem::take(&mut ctx.byte_buf));
+    }
+
+    if complete.is_empty() {
+        *body = None;
+        return Ok(None);
+    }
+
+    let content = match std::str::from_utf8(&complete) {
+        Ok(s) => s,
+        Err(_) => {
+            *body = Some(Bytes::from(complete));
+            return Ok(None);
+        }
+    };
+
+    let base = ctx.base_url.as_ref().unwrap();
+    let origin_base = ctx.origin_base.as_ref().unwrap();
+    let proxy_base = ctx.proxy_base.as_ref().unwrap();
+
+    let (new_content, new_pending) = Self::rewrite_m3u8_lines(
+        content,
+        base,
+        origin_base,
+        proxy_base,
+        end_of_stream,
+        ctx.pending_tag.take(),
+    );
+
+    if !end_of_stream {
+        ctx.pending_tag = new_pending;
+    }
+
+    *body = Some(Bytes::from(new_content));
+    Ok(None)
+}
+
+   async fn logging(
+    &self,
+    session: &mut Session,
+    e: Option<&Error>,
+    _ctx: &mut Self::CTX,
+) {
+    let req = session.req_header();
+
+    let status = session
+        .response_written()
+        .map(|r| r.status.as_u16())
+        .unwrap_or(0);
+
+    let client = session
+        .client_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| "unknown".into());
+
+    if let Some(err) = e {
+        // 客户端主动断开（播放器切台/停止/超时）
+        let client_abort = err.esource == ErrorSource::Downstream
+            && matches!(
+                err.etype,
+                ErrorType::WriteError
+                    | ErrorType::ReadError
+                    | ErrorType::ConnectionClosed
+            );
+
+        // 4xx 也是客户端问题
+        let client_error = matches!(err.etype, ErrorType::HTTPStatus(_));
+
+        if client_abort || client_error {
+            debug!(
+                "{} {} {} - client-side (Status:{}): {}",
+                client,
+                req.method,
+                req.uri.path(),
+                status,
+                err
+            );
         } else {
-            debug!("{} {} {} - Status:{}", client, req.method, req.uri.path(), status);
+            error!(
+                "{} {} {} - Status:{} Error:{:?}",
+                client,
+                req.method,
+                req.uri.path(),
+                status,
+                err
+            );
         }
+    } else {
+        debug!(
+            "{} {} {} - Status:{}",
+            client,
+            req.method,
+            req.uri.path(),
+            status
+        );
     }
+}
 }
 
 /// 双写日志 writer：同一行日志同时输出到 stderr 与日志文件。
