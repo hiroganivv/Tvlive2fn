@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::net::SocketAddr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{RwLock, OnceLock};
 use std::time::{Duration, Instant};
 
 const DEFAULT_REFERER: &str = "https://missav.ws/dm242/cn";
@@ -22,47 +22,61 @@ const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Appl
 /// 确保即便设置了上游白名单，surrit.com 这类核心源站也不会被误挡。
 const DEFAULT_ALLOW_HOSTS: &[&str] = &["surrit.com"];
 
-/// 上游 DNS 解析缓存：强制优先 IPv4，避免家庭网络下连 IPv6 上游超时；
-/// 缓存带 TTL（5 分钟），避免每个 .ts 分片都重复做 DNS 查询。
+/// 上游 DNS 解析缓存：强制优先 IPv4，避免家庭网络下连 IPv6 上游超时。
+/// 策略：缓存该域名解析出的"全部 A 记录"，但每个 host 固定 sticky 使用其中某一个 IP
+/// （`idx`），而非每请求都换 IP。原因：Pingora 按 (IP, SNI) 维护上游连接池，
+/// sticky 能让同一频道的连续分片复用同一条已建好的 TLS 连接（idle_timeout 60s），
+/// 省掉反复握手（~0.5-1s）带来的卡顿——这对单路顺序取段的播放器体验至关重要。
+/// 仅当该 IP "建连失败"时才在 fail_to_connect 里把 idx 切到下一个边缘（failover），
+/// 且 TTL 缩短为 60s，使持续变差的边缘能被较快轮换掉。
 struct DnsCacheEntry {
-    addr: SocketAddr,
+    addrs: Vec<SocketAddr>,
+    idx: usize,
     ts: Instant,
 }
 
-static DNS_CACHE: OnceLock<Mutex<HashMap<String, DnsCacheEntry>>> = OnceLock::new();
-const DNS_TTL: Duration = Duration::from_secs(300);
+static DNS_CACHE: OnceLock<RwLock<HashMap<String, DnsCacheEntry>>> = OnceLock::new();
+const DNS_TTL: Duration = Duration::from_secs(60);
 
-/// 解析主机名为 SocketAddr，优先 IPv4；仅当不存在 A 记录时才回退 IPv6。
+/// 解析主机名为 SocketAddr，优先 IPv4（仅当无 A 记录才回退 AAAA）。
 /// 返回的是裸 IP，Pingora 会用 `host` 作为 SNI/证书校验，不影响 HTTPS。
+/// 命中缓存时返回当前 sticky 的 IP；未命中则解析全部 A 记录后取第一个。
 async fn resolve_upstream_addr(host: &str, port: u16) -> Result<SocketAddr> {
-    // 1) 命中缓存且未过期，直接返回，零系统调用
+    // 1) 命中缓存且未过期：返回当前 sticky 的 IP，零系统调用，且保证连接池可复用
     if let Some(cache) = DNS_CACHE.get() {
-        if let Ok(guard) = cache.lock() {
+        if let Ok(guard) = cache.read() {
             if let Some(e) = guard.get(host) {
-                if e.ts.elapsed() < DNS_TTL {
-                    return Ok(e.addr);
+                if e.ts.elapsed() < DNS_TTL && !e.addrs.is_empty() {
+                    return Ok(e.addrs[e.idx % e.addrs.len()]);
                 }
             }
         }
     }
 
-    // 2) 解析：lookup_host 同时返回 A 与 AAAA，过滤出 IPv4 优先
-    let mut addrs = tokio::net::lookup_host((host, port))
+    // 2) 解析：lookup_host 同时返回 A 与 AAAA，收集全部 IPv4 优先
+    let addrs_iter = tokio::net::lookup_host((host, port))
         .await
         .map_err(|e| Error::explain(ErrorType::InternalError, format!("DNS resolve {host}: {e}")))?;
-    let addr = addrs
-        .by_ref()
-        .find(|a| a.is_ipv4())
-        .or_else(|| addrs.next())
-        .ok_or_else(|| Error::explain(ErrorType::InternalError, format!("no address for {host}")))?;
-
-    // 3) 写回缓存（即便已过期也更新）
-    let cache = DNS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(mut guard) = cache.lock() {
-        guard.insert(host.to_string(), DnsCacheEntry { addr, ts: Instant::now() });
+    let mut ipv4: Vec<SocketAddr> = Vec::new();
+    let mut ipv6: Vec<SocketAddr> = Vec::new();
+    for a in addrs_iter {
+        if a.is_ipv4() {
+            ipv4.push(a);
+        } else {
+            ipv6.push(a);
+        }
+    }
+    let addrs: Vec<SocketAddr> = if !ipv4.is_empty() { ipv4 } else { ipv6 };
+    if addrs.is_empty() {
+        return Err(Error::explain(ErrorType::InternalError, format!("no address for {host}")));
     }
 
-    Ok(addr)
+    // 3) 写回缓存（即便已过期也更新），idx=0 表示先用第一个边缘
+    let cache = DNS_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    if let Ok(mut guard) = cache.write() {
+        guard.insert(host.to_string(), DnsCacheEntry { addrs: addrs.clone(), idx: 0, ts: Instant::now() });
+    }
+    Ok(addrs[0])
 }
 
 #[derive(Clone)]
@@ -301,13 +315,13 @@ impl ProxyHttp for IptvProxy {
         ProxyContext::new()
     }
 
-    // 上游连接建立失败（ConnectError / ConnectTimedout）时自动重试 1 次：
-    // 对可重试的错误调用 Error::set_retry(true)，pingora 会重新调用 upstream_peer() 再连一次。
-    // 代理的请求全部是幂等 GET（m3u8 / TS 分片 / 密钥），重试安全。
-    // 播放器请求分片时常因上游首次握手慢而超时 abort（表现为日志里的
-    // Downstream ConnectionClosed、以及"要多次点击播放才能播"），
-    // 由代理自行重试后，播放器无需再手动重连。
-    // 同时清除该域名 DNS 缓存，让重试时重新解析（避免失效 IP 被缓存 5 分钟反复失败）。
+    // 上游建连失败（TCP 连不上 / 连接超时 / TLS 握手失败 / 上游提前 RST 等）时自动重试 1 次：
+    // 对错误调用 Error::set_retry(true)，pingora 会重新调用 upstream_peer() 再连一次。
+    // fail_to_connect 只在"与上游建连失败"时触发（esource 一定是 Upstream），因此这里
+    // 不逐个匹配具体的 ErrorType 变体（避免与具体 pingora 版本拼写不一致而编译失败），
+    // 直接对建连失败统一重试；代理的请求全是幂等 GET，重试安全。
+    // 配合上面的 Sticky DNS：重试时把该 host 的 sticky 下标切到下一个边缘节点（failover），
+    // 从而绕开恰好死掉/被墙的 Cloudflare 边缘，显著减少"播放器超时断开 → 要多次点击才能播"。
     fn fail_to_connect(
         &self,
         _session: &mut Session,
@@ -315,20 +329,24 @@ impl ProxyHttp for IptvProxy {
         ctx: &mut Self::CTX,
         mut e: Box<Error>,
     ) -> Box<Error> {
-        let retryable = matches!(e.etype, ErrorType::ConnectError | ErrorType::ConnectTimedout);
-        if retryable && ctx.retry_count < 1 {
-            // 清除 DNS 缓存，重试时重新解析，换一个可用 IP
+        if ctx.retry_count < 1 {
+            // 把该 host 的 sticky 下标切到下一个边缘，重试时 upstream_peer 会连到新 IP
             if let Some(host) = ctx.target_url.as_ref().and_then(|u| u.host_str()) {
                 if let Some(cache) = DNS_CACHE.get() {
-                    if let Ok(mut g) = cache.lock() {
-                        if g.remove(host).is_some() {
-                            debug!("DNS cache invalidated for {host} (fail_to_connect)");
+                    if let Ok(mut g) = cache.write() {
+                        if let Some(entry) = g.get_mut(host) {
+                            if entry.addrs.len() > 1 {
+                                entry.idx = (entry.idx + 1) % entry.addrs.len();
+                                entry.ts = Instant::now(); // 重置 TTL，让新边缘稳定用一小会儿
+                                debug!("DNS failover: rotated {} to IP #{}", host, entry.idx);
+                            }
                         }
                     }
                 }
             }
             ctx.retry_count += 1;
             e.set_retry(true);
+            info!("Upstream connect failed, retrying ({e})");
         }
         e
     }
@@ -448,16 +466,16 @@ impl ProxyHttp for IptvProxy {
         let addr = resolve_upstream_addr(&host, port).await?;
 
         let mut peer = HttpPeer::new(addr, is_https, host.clone());
-        // 上游连接调优（针对播放器"请求分片时提前断开 / 需多次点击才能播放"问题）：
-        // - connection_timeout / total_connection_timeout 收紧：上游慢时快速失败，
-        //   配合下方 fail_to_connect 自动重试，让代理在播放器超时 abort 之前就完成连接或失败重试，
-        //   避免播放器干等后主动 RST（即日志里的 Downstream ConnectionClosed）。
-        // - idle_timeout 拉长：让建好的 TLS 连接在连接池里多活一会儿，减少 web 播放器
-        //   频繁 abort / 并发取段时反复做 TLS 握手（~0.5-1s）造成的卡顿。
-        peer.options.connection_timeout = Some(Duration::from_secs(2));
-        peer.options.total_connection_timeout = Some(Duration::from_secs(5));
+        // 上游连接调优（针对 surrit.com 这类 Cloudflare 源站的"慢边缘 / 握手慢"问题）：
+        // - connection_timeout 3s：单个边缘 TCP 连不上时快速失败，触发 fail_to_connect 重试到下一个 IP；
+        // - total_connection_timeout 8s：覆盖 TCP+TLS 握手总耗时，超时即换边缘；
+        // - idle_timeout 60s：建好的 TLS 连接留在连接池里多活一会儿，HLS 播放器并发取段时复用，
+        //   省掉反复 TLS 握手（~0.5-1s）带来的卡顿；
+        // - read_timeout 30s：TS 分片可能较大 / 上游偶发慢，放宽读超时避免被误判为断流。
+        peer.options.connection_timeout = Some(Duration::from_secs(3));
+        peer.options.total_connection_timeout = Some(Duration::from_secs(8));
         peer.options.idle_timeout = Some(Duration::from_secs(60));
-        peer.options.read_timeout = Some(Duration::from_secs(15));
+        peer.options.read_timeout = Some(Duration::from_secs(30));
 
         debug!("Upstream: {} ({}) TLS: {}", addr, host, is_https);
         Ok(Box::new(peer))
@@ -657,7 +675,7 @@ impl ProxyHttp for IptvProxy {
             {
                 if let Some(host) = ctx.target_url.as_ref().and_then(|u| u.host_str()) {
                     if let Some(cache) = DNS_CACHE.get() {
-                        if let Ok(mut g) = cache.lock() {
+                        if let Ok(mut g) = cache.write() {
                             if g.remove(host).is_some() {
                                 debug!("DNS cache invalidated for {host}");
                             }
