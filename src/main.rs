@@ -181,10 +181,11 @@ impl ProxyHttp for IptvProxy {
             let mut url = url::Url::parse(&decoded_str)
                 .map_err(|e| Error::explain(ErrorType::HTTPStatus(400), format!("invalid URL: {e}")))?;
 
-            // 校验目标 host：必须存在且为合法 FQDN/IP（含 "."），拒绝裸主机名（如 "sur"），
+            // 校验目标 host：必须存在且为合法 FQDN/IP（含 "."、且不以 "." 结尾），
+            // 拒绝裸主机名（如 "sur"）或畸形主机名（如 "surrit."），
             // 既避免无谓的 DNS 查询与 500 错误刷屏，也挡掉扫描器的垃圾请求。
             let host = url.host_str().unwrap_or("").to_string();
-            if host.is_empty() || !host.contains('.') {
+            if host.is_empty() || !host.contains('.') || host.ends_with('.') {
                 return Err(Error::explain(ErrorType::HTTPStatus(400), "invalid target host"));
             }
 
@@ -260,8 +261,19 @@ impl ProxyHttp for IptvProxy {
         // 解析为 IPv4 优先地址，避免连 IPv6 上游超时（家庭网络常见），并带 DNS 缓存
         let addr = resolve_upstream_addr(&host, port).await?;
 
+        let mut peer = HttpPeer::new(addr, is_https, host);
+        // 上游连接调优：
+        // - idle_timeout 拉长：让建好的 TLS 连接在连接池里多活一会儿，减少 web 播放器
+        //   频繁 abort / 并发取段时反复做 TLS 握手（~0.5-1s）造成的卡顿。
+        // - connection_timeout / total_connection_timeout 缩短：上游慢时快速失败，
+        //   而不是让客户端（web 播放器）一直干等后超时重连，放大卡顿。
+        peer.options.connection_timeout = Some(Duration::from_secs(3));
+        peer.options.total_connection_timeout = Some(Duration::from_secs(8));
+        peer.options.idle_timeout = Some(Duration::from_secs(60));
+        peer.options.read_timeout = Some(Duration::from_secs(20));
+
         debug!("Upstream: {} ({}) TLS: {}", addr, host, is_https);
-        Ok(Box::new(HttpPeer::new(addr, is_https, host)))
+        Ok(Box::new(peer))
     }
 
     async fn upstream_request_filter(&self, session: &mut Session, upstream_request: &mut RequestHeader, ctx: &mut Self::CTX) -> Result<()> {
