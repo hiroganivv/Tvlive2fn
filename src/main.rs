@@ -9,6 +9,8 @@ use pingora::proxy::{ProxyHttp, Session};
 use pingora::server::configuration::Opt;
 use pingora::server::Server;
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -87,6 +89,9 @@ pub struct ProxyContext {
     pending_tag: Option<String>,
     // 预生成的代理前缀，避免每个 chunk 重复拼接
     proxy_base: Option<String>,
+    // 上游无视 Accept-Encoding 仍返回压缩体（gzip 等）时为 true：文本改写会损坏数据，
+    // 需跳过改写、原样透传，让播放器自行解压
+    skip_rewrite: bool,
 }
 
 impl ProxyContext {
@@ -100,6 +105,7 @@ impl ProxyContext {
             byte_buf: Vec::new(),
             pending_tag: None,
             proxy_base: None,
+            skip_rewrite: false,
         }
     }
 }
@@ -132,33 +138,155 @@ impl IptvProxy {
             ".aac", ".mp3", ".ogg", ".opus", ".vtt", ".srt",
             ".jpeg", ".jpg", ".png", ".key",
         ];
+        // 绝对路径（/ 开头）一律按媒体处理，保证 m3u8 内所有相对 URI 都被代理
         if line.starts_with('/') {
             return true;
         }
+        // 去掉查询参数后按扩展名判定。
+        // 注意：纯数字文件名（如 12345.ts / 00000000/12345.ts）在 IPTV 中非常常见，
+        // 此前"纯数字则跳过改写"会导致这些分片行被漏改、进而被丢弃，
+        // 播放器拿到残缺列表 → 播放 1 秒后中断。因此不再对文件名做数字特判。
         let path = match line.find('?') {
             Some(pos) => &line[..pos],
             None => line,
         };
-        for ext in MEDIA_EXTS {
-            if path.ends_with(ext) {
-                let file_part = &path[..path.len() - ext.len()];
-                let filename = match file_part.rfind('/') {
-                    Some(pos) => &file_part[pos+1..],
-                    None => file_part,
-                };
-                if filename.is_empty() || filename.chars().all(|c| c.is_ascii_digit()) {
-                    return false;
-                }
-                return true;
-            }
-        }
-        false
+        MEDIA_EXTS.iter().any(|ext| path.ends_with(ext))
     }
 
     fn tag_requires_uri(line: &str) -> bool {
         line.starts_with("#EXTINF:")
             || line.starts_with("#EXT-X-STREAM-INF:")
             || line.starts_with("#EXT-X-I-FRAME-STREAM-INF:")
+    }
+
+    /// 改写 m3u8 标签行中 `URI="..."` 形式的资源引用（#EXT-X-KEY、#EXT-X-MAP、
+    /// #EXT-X-MEDIA、#EXT-X-SESSION-KEY 等），使加密密钥、fMP4 初始化段等资源
+    /// 也统一走本代理，否则播放器会按 m3u8 的基址去请求代理服务本身而 400。
+    fn rewrite_quoted_uri(line: &str, base: &str, origin_base: &str, proxy_base: &str) -> String {
+        let mut out = String::with_capacity(line.len() + 64);
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        let n = bytes.len();
+        while i < n {
+            if i + 4 <= n && &bytes[i..i + 4] == b"URI=" {
+                out.push_str("URI=");
+                i += 4;
+                if i < n && bytes[i] == b'"' {
+                    if let Some(end) = line[i + 1..].find('"') {
+                        let uri = &line[i + 1..i + 1 + end];
+                        let full = if uri.starts_with("http://") || uri.starts_with("https://") {
+                            uri.to_string()
+                        } else if uri.starts_with('/') {
+                            format!("{}{}", origin_base, uri)
+                        } else {
+                            format!("{}{}", base, uri)
+                        };
+                        out.push('"');
+                        out.push_str(proxy_base);
+                        out.push_str(&urlencoding::encode(&full));
+                        out.push('"');
+                        i += 1 + end + 1;
+                        continue;
+                    }
+                }
+            }
+            // 普通字符原样拷贝
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+        out
+    }
+
+    /// 对一段"已完整切分、可安全 UTF-8 解码"的 m3u8 文本逐行改写。
+    /// 返回 (改写后的文本, 新的 pending_tag)。
+    fn rewrite_m3u8_lines(
+        content: &str,
+        base: &str,
+        origin_base: &str,
+        proxy_base: &str,
+        end_of_stream: bool,
+        pending_tag: Option<String>,
+    ) -> (String, Option<String>) {
+        let mut new_content = String::with_capacity(content.len() + 64);
+        let mut pending = pending_tag;
+
+        for line in content.lines() {
+            if line.starts_with('#') {
+                if let Some(tag) = pending.take() {
+                    new_content.push_str(&tag);
+                    new_content.push('\n');
+                }
+                if Self::tag_requires_uri(line) {
+                    pending = Some(line.to_string());
+                } else {
+                    // 对含 URI="..." 的标签（#EXT-X-KEY / #EXT-X-MAP / #EXT-X-MEDIA 等）
+                    // 改写引号内的资源地址，让密钥与 fMP4 初始化段也走代理
+                    if line.contains("URI=\"") {
+                        let rewritten = Self::rewrite_quoted_uri(line, base, origin_base, proxy_base);
+                        new_content.push_str(&rewritten);
+                    } else {
+                        new_content.push_str(line);
+                    }
+                    new_content.push('\n');
+                }
+            } else if line.is_empty() {
+                if let Some(tag) = pending.take() {
+                    new_content.push_str(&tag);
+                    new_content.push('\n');
+                }
+                new_content.push('\n');
+            } else if line.starts_with("http://") || line.starts_with("https://") {
+                if let Some(tag) = pending.take() {
+                    new_content.push_str(&tag);
+                    new_content.push('\n');
+                }
+                new_content.push_str(proxy_base);
+                new_content.push_str(&urlencoding::encode(line));
+                new_content.push('\n');
+            } else if Self::is_likely_media_resource(line) {
+                if let Some(tag) = pending.take() {
+                    new_content.push_str(&tag);
+                    new_content.push('\n');
+                }
+                let full_url = if line.starts_with('/') {
+                    format!("{}{}", origin_base, line)
+                } else {
+                    format!("{}{}", base, line)
+                };
+                if full_url.ends_with(".jpeg") {
+                    let ts_url = full_url.replace(".jpeg", ".ts");
+                    let sep = if ts_url.contains('?') { "&" } else { "?" };
+                    let fixed = format!("{}{}real_ext=jpeg", ts_url, sep);
+                    new_content.push_str(proxy_base);
+                    new_content.push_str(&urlencoding::encode(&fixed));
+                    new_content.push('\n');
+                } else {
+                    new_content.push_str(proxy_base);
+                    new_content.push_str(&urlencoding::encode(&full_url));
+                    new_content.push('\n');
+                }
+            } else {
+                // 未识别行（无扩展名的相对 URI、异常注释等）：原样透传，绝不静默丢弃。
+                // 此前这里只清 pending_tag 不输出行，任何被判为"非媒体"的 URI（如纯数字
+                // 分片名）都会从播放列表里消失，直接导致播放 1 秒后无分片可拉而中断。
+                if let Some(tag) = pending.take() {
+                    new_content.push_str(&tag);
+                    new_content.push('\n');
+                }
+                new_content.push_str(line);
+                new_content.push('\n');
+            }
+        }
+
+        // 流结束时若仍有悬挂的标签（异常 m3u8），照原行为将其刷出；否则留给后续 chunk
+        if end_of_stream {
+            if let Some(tag) = pending.take() {
+                new_content.push_str(&tag);
+                new_content.push('\n');
+            }
+        }
+
+        (new_content, pending)
     }
 }
 
@@ -303,13 +431,17 @@ impl ProxyHttp for IptvProxy {
         let url = ctx.target_url.as_ref()
             .ok_or_else(|| Error::explain(ErrorType::InternalError, "No target"))?;
 
-        let mut path_and_query = match url.query() {
-            Some(q) => format!("{}?{}", url.path(), q),
-            None => url.path().to_string(),
+        // 拼接上游请求的 path + query。jpeg 修正只作用于 path 中的 .ts 后缀，
+        // 查询参数原样保留（此前 replace 作用于整个字符串，可能误伤 query 里的 .ts 字样）
+        let path = if ctx.needs_jpeg_fix {
+            url.path().replace(".ts", ".jpeg")
+        } else {
+            url.path().to_string()
         };
-        if ctx.needs_jpeg_fix {
-            path_and_query = path_and_query.replace(".ts", ".jpeg");
-        }
+        let path_and_query = match url.query() {
+            Some(q) => format!("{}?{}", path, q),
+            None => path,
+        };
         let uri = Uri::try_from(path_and_query)
             .map_err(|e| Error::explain(ErrorType::InternalError, format!("URI: {e}")))?;
         upstream_request.set_uri(uri);
@@ -390,6 +522,19 @@ impl ProxyHttp for IptvProxy {
         }
 
         if ctx.is_m3u8 {
+            // 防御：上游可能无视我们移除 Accept-Encoding 仍返回 gzip 压缩体。
+            // 此时 body 是压缩字节流，按文本改写必然损坏播放列表 → 标记跳过改写、原样透传，
+            // 由播放器自行解压。
+            let enc = upstream_response
+                .headers
+                .get("content-encoding")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("identity");
+            if !enc.eq_ignore_ascii_case("identity") {
+                ctx.skip_rewrite = true;
+                return Ok(());
+            }
+            // 改写后内容长度必然变化，去掉 Content-Length 交给 pingora 重新分块
             upstream_response.remove_header("Content-Length");
         }
 
@@ -397,7 +542,7 @@ impl ProxyHttp for IptvProxy {
     }
 
     fn response_body_filter(&self, _session: &mut Session, body: &mut Option<Bytes>, end_of_stream: bool, ctx: &mut Self::CTX) -> Result<Option<Duration>> {
-        if !ctx.is_m3u8 {
+        if !ctx.is_m3u8 || ctx.skip_rewrite {
             return Ok(None);
         }
 
@@ -413,7 +558,7 @@ impl ProxyHttp for IptvProxy {
 
         // 仅在 \n 字节边界切分（0x0A 不会出现在多字节 UTF-8 字符内部），
         // 因此"完整部分"一定是合法 UTF-8，可被安全解码；剩余尾巴留到下一个 chunk。
-        let (complete, tail) = match ctx.byte_buf.iter().rposition(|&b| b == b'\n') {
+        let (mut complete, tail) = match ctx.byte_buf.iter().rposition(|&b| b == b'\n') {
             Some(pos) => {
                 let end = pos + 1;
                 (ctx.byte_buf[..end].to_vec(), ctx.byte_buf[end..].to_vec())
@@ -421,6 +566,12 @@ impl ProxyHttp for IptvProxy {
             None => (std::mem::take(&mut ctx.byte_buf), Vec::new()),
         };
         ctx.byte_buf = tail;
+
+        // 流结束时，缓冲里可能还剩"最后一行但没有 \n 结尾"的字节（很多 m3u8 的末行无换行）。
+        // 若不合并，最后一行分片会被永久吞掉 → 播放列表缺尾片。这里把它们补进本轮的完整行。
+        if end_of_stream && !ctx.byte_buf.is_empty() {
+            complete.extend_from_slice(&std::mem::take(&mut ctx.byte_buf));
+        }
 
         if complete.is_empty() {
             *body = None;
@@ -440,70 +591,16 @@ impl ProxyHttp for IptvProxy {
         let origin_base = ctx.origin_base.as_ref().expect("origin_base missing");
         let proxy_base = ctx.proxy_base.as_ref().expect("proxy_base missing");
 
-        let mut new_content = String::with_capacity(content.len() + 64);
-        let mut pending_tag = ctx.pending_tag.take();
-
-        for line in content.lines() {
-            if line.starts_with('#') {
-                if let Some(tag) = pending_tag.take() {
-                    new_content.push_str(&tag);
-                    new_content.push('\n');
-                }
-                if Self::tag_requires_uri(line) {
-                    pending_tag = Some(line.to_string());
-                } else {
-                    new_content.push_str(line);
-                    new_content.push('\n');
-                }
-            } else if line.is_empty() {
-                if let Some(tag) = pending_tag.take() {
-                    new_content.push_str(&tag);
-                    new_content.push('\n');
-                }
-                new_content.push('\n');
-            } else if line.starts_with("http://") || line.starts_with("https://") {
-                if let Some(tag) = pending_tag.take() {
-                    new_content.push_str(&tag);
-                    new_content.push('\n');
-                }
-                new_content.push_str(proxy_base);
-                new_content.push_str(&urlencoding::encode(line));
-                new_content.push('\n');
-            } else if Self::is_likely_media_resource(line) {
-                if let Some(tag) = pending_tag.take() {
-                    new_content.push_str(&tag);
-                    new_content.push('\n');
-                }
-                let full_url = if line.starts_with('/') {
-                    format!("{}{}", origin_base, line)
-                } else {
-                    format!("{}{}", base, line)
-                };
-                if full_url.ends_with(".jpeg") {
-                    let ts_url = full_url.replace(".jpeg", ".ts");
-                    let sep = if ts_url.contains('?') { "&" } else { "?" };
-                    let fixed = format!("{}{}real_ext=jpeg", ts_url, sep);
-                    new_content.push_str(proxy_base);
-                    new_content.push_str(&urlencoding::encode(&fixed));
-                    new_content.push('\n');
-                } else {
-                    new_content.push_str(proxy_base);
-                    new_content.push_str(&urlencoding::encode(&full_url));
-                    new_content.push('\n');
-                }
-            } else {
-                pending_tag = None;
-            }
-        }
-
-        // 流结束时若仍有悬挂的标签（异常 m3u8），照原行为将其刷出；否则留给后续 chunk
-        if end_of_stream {
-            if let Some(tag) = pending_tag.take() {
-                new_content.push_str(&tag);
-                new_content.push('\n');
-            }
-        } else {
-            ctx.pending_tag = pending_tag;
+        let (new_content, new_pending) = Self::rewrite_m3u8_lines(
+            content,
+            base,
+            origin_base,
+            proxy_base,
+            end_of_stream,
+            ctx.pending_tag.take(),
+        );
+        if !end_of_stream {
+            ctx.pending_tag = new_pending;
         }
 
         debug!("M3U8 rewritten ({} bytes)", new_content.len());
@@ -539,9 +636,46 @@ impl ProxyHttp for IptvProxy {
     }
 }
 
+/// 双写日志 writer：同一行日志同时输出到 stderr 与日志文件。
+/// 服务以守护方式（procd / systemd，无终端）启动时，也能在
+/// <LOG_FILE 或 /tmp/iptv-proxy.log> 里实时调试。
+struct DualWriter {
+    file: Option<File>,
+}
+
+impl Write for DualWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // stderr 写入失败（如管道关闭）不影响服务运行，忽略即可
+        let _ = io::stderr().write_all(buf);
+        if let Some(f) = self.file.as_mut() {
+            let _ = f.write_all(buf);
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        let _ = io::stderr().flush();
+        if let Some(f) = self.file.as_mut() {
+            let _ = f.flush();
+        }
+        Ok(())
+    }
+}
+
 fn main() {
+    // 日志同时输出到 stderr 与文件：默认 <系统临时目录>/iptv-proxy.log（Linux 即 /tmp/iptv-proxy.log），
+    // 可用环境变量 LOG_FILE 覆盖；文件以追加方式打开，失败时降级为仅 stderr，不影响启动。
+    let log_file_path = std::env::var("LOG_FILE")
+        .unwrap_or_else(|_| std::env::temp_dir().join("iptv-proxy.log").to_string_lossy().into_owned());
+    let log_file = match OpenOptions::new().create(true).append(true).open(&log_file_path) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            eprintln!("WARN: cannot open log file {log_file_path}: {e}, stderr only");
+            None
+        }
+    };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_millis()
+        .target(env_logger::Target::Pipe(Box::new(DualWriter { file: log_file })))
         .init();
 
     let mut args = std::env::args().skip(1);
@@ -557,7 +691,8 @@ fn main() {
         .unwrap_or_else(|| "192.168.1.3".to_string());
 
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
-    let bind_port: u16 = bind_addr.split(':').nth(1).and_then(|p| p.parse().ok()).unwrap_or(8080);
+    // 用 SocketAddr 解析端口，兼容 IPv6（如 [::1]:8080）
+    let bind_port: u16 = bind_addr.parse::<SocketAddr>().map(|sa| sa.port()).unwrap_or(8080);
 
     // WORKERS 真正生效：Pingora 的 Opt 没有 threads 字段，线程数由 ServerConf::threads 控制，
     // 只能通过 YAML 配置文件注入（Opt::conf）。因此当设置了 WORKERS 时，生成一份最小配置。
@@ -581,6 +716,7 @@ fn main() {
     info!("========================================");
     info!("Local IP: {}", local_ip);
     info!("Bind: {}", bind_addr);
+    info!("Log file: {}", log_file_path);
 
     let config = ProxyConfig::new(local_ip.clone(), bind_port);
     let mut server = Server::new(Some(Opt {
@@ -602,4 +738,119 @@ fn main() {
     info!("========================================");
 
     server.run_forever();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PROXY: &str = "http://192.168.1.3:8080/?url=";
+    const ORIGIN: &str = "http://hls.example.com";
+    const BASE: &str = "http://hls.example.com/live/";
+
+    #[test]
+    fn media_resource_detection() {
+        // 纯数字文件名（IPTV 常见）必须被识别为媒体——修复前的误判会导致分片被丢弃
+        assert!(IptvProxy::is_likely_media_resource("12345.ts"));
+        assert!(IptvProxy::is_likely_media_resource("00000000/12345.ts"));
+        assert!(IptvProxy::is_likely_media_resource("segment001.ts"));
+        assert!(IptvProxy::is_likely_media_resource("subdir/file.m4s"));
+        assert!(IptvProxy::is_likely_media_resource("/abs/path/file.ts"));
+        assert!(IptvProxy::is_likely_media_resource("file.ts?token=abc"));
+        assert!(IptvProxy::is_likely_media_resource("key.key"));
+        assert!(!IptvProxy::is_likely_media_resource("file.txt"));
+        assert!(!IptvProxy::is_likely_media_resource("notes.txt"));
+        assert!(!IptvProxy::is_likely_media_resource("README"));
+    }
+
+    #[test]
+    fn quoted_uri_rewrite() {
+        // 相对路径（基于 m3u8 所在目录）
+        let out = IptvProxy::rewrite_quoted_uri(
+            r#"#EXT-X-KEY:METHOD=AES-128,URI="key.key""#,
+            BASE, ORIGIN, PROXY,
+        );
+        assert!(
+            out.contains("URI=\"http://192.168.1.3:8080/?url=http%3A%2F%2Fhls.example.com%2Flive%2Fkey.key\""),
+            "got: {out}"
+        );
+
+        // 绝对路径（基于源站根）
+        let out = IptvProxy::rewrite_quoted_uri(
+            r#"#EXT-X-MAP:URI="/init.mp4""#,
+            BASE, ORIGIN, PROXY,
+        );
+        assert!(
+            out.contains("URI=\"http://192.168.1.3:8080/?url=http%3A%2F%2Fhls.example.com%2Finit.mp4\""),
+            "got: {out}"
+        );
+
+        // 绝对 URL 直接编码
+        let out = IptvProxy::rewrite_quoted_uri(
+            r#"#EXT-X-KEY:METHOD=AES-128,URI="https://cdn.example.com/k/abc.key""#,
+            BASE, ORIGIN, PROXY,
+        );
+        assert!(
+            out.contains("URI=\"http://192.168.1.3:8080/?url=https%3A%2F%2Fcdn.example.com%2Fk%2Fabc.key\""),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn full_playlist_rewrite() {
+        let input = "#EXTM3U\n\
+#EXT-X-VERSION:3\n\
+#EXT-X-TARGETDURATION:10\n\
+#EXTINF:10.0,\n\
+12345.ts\n\
+#EXTINF:10.0,\n\
+segment002.ts\n\
+#EXTINF:10.0,\n\
+/abs/dir/003.ts\n\
+#EXTINF:10.0,\n\
+http://cdn.example.com/live/004.ts\n";
+        let (out, pending) = IptvProxy::rewrite_m3u8_lines(input, BASE, ORIGIN, PROXY, true, None);
+        assert!(pending.is_none());
+
+        // 纯数字分片必须被改写而不是被丢弃（播放 1 秒中断的根因）
+        assert!(
+            out.contains("http://192.168.1.3:8080/?url=http%3A%2F%2Fhls.example.com%2Flive%2F12345.ts"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("http://192.168.1.3:8080/?url=http%3A%2F%2Fhls.example.com%2Flive%2Fsegment002.ts"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("http://192.168.1.3:8080/?url=http%3A%2F%2Fhls.example.com%2Fabs%2Fdir%2F003.ts"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("http://192.168.1.3:8080/?url=http%3A%2F%2Fcdn.example.com%2Flive%2F004.ts"),
+            "got: {out}"
+        );
+
+        // 标签顺序与数量保持
+        assert_eq!(out.matches("#EXTINF:10.0,").count(), 4);
+        assert!(out.starts_with("#EXTM3U\n"));
+        assert!(out.contains("#EXT-X-VERSION:3\n"));
+        assert!(out.contains("#EXT-X-TARGETDURATION:10\n"));
+    }
+
+    #[test]
+    fn pending_tag_cross_chunk() {
+        // 第一个 chunk 只有 #EXTINF，未到流结束 → 标签保留在 pending，不提前输出
+        let (out, pending) = IptvProxy::rewrite_m3u8_lines("#EXTINF:10.0,\n", BASE, ORIGIN, PROXY, false, None);
+        assert!(out.is_empty(), "got: {out}");
+        assert_eq!(pending.as_deref(), Some("#EXTINF:10.0,"));
+
+        // 第二个 chunk 携带分片且流结束 → 标签与分片一并输出
+        let (out, pending) = IptvProxy::rewrite_m3u8_lines("12345.ts\n", BASE, ORIGIN, PROXY, true, pending);
+        assert!(pending.is_none());
+        assert!(out.contains("#EXTINF:10.0,\n"), "got: {out}");
+        assert!(
+            out.contains("http://192.168.1.3:8080/?url=http%3A%2F%2Fhls.example.com%2Flive%2F12345.ts"),
+            "got: {out}"
+        );
+    }
 }
