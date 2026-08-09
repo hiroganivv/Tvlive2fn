@@ -8,10 +8,56 @@ use pingora::proxy::http_proxy_service;
 use pingora::proxy::{ProxyHttp, Session};
 use pingora::server::configuration::Opt;
 use pingora::server::Server;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 const DEFAULT_REFERER: &str = "https://missav.ws/dm242/cn";
 const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+/// 上游 DNS 解析缓存：强制优先 IPv4，避免家庭网络下连 IPv6 上游超时；
+/// 缓存带 TTL（5 分钟），避免每个 .ts 分片都重复做 DNS 查询。
+struct DnsCacheEntry {
+    addr: SocketAddr,
+    ts: Instant,
+}
+
+static DNS_CACHE: OnceLock<Mutex<HashMap<String, DnsCacheEntry>>> = OnceLock::new();
+const DNS_TTL: Duration = Duration::from_secs(300);
+
+/// 解析主机名为 SocketAddr，优先 IPv4；仅当不存在 A 记录时才回退 IPv6。
+/// 返回的是裸 IP，Pingora 会用 `host` 作为 SNI/证书校验，不影响 HTTPS。
+async fn resolve_upstream_addr(host: &str, port: u16) -> Result<SocketAddr> {
+    // 1) 命中缓存且未过期，直接返回，零系统调用
+    if let Some(cache) = DNS_CACHE.get() {
+        if let Ok(guard) = cache.lock() {
+            if let Some(e) = guard.get(host) {
+                if e.ts.elapsed() < DNS_TTL {
+                    return Ok(e.addr);
+                }
+            }
+        }
+    }
+
+    // 2) 解析：lookup_host 同时返回 A 与 AAAA，过滤出 IPv4 优先
+    let mut addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| Error::explain(ErrorType::InternalError, format!("DNS resolve {host}: {e}")))?;
+    let addr = addrs
+        .by_ref()
+        .find(|a| a.is_ipv4())
+        .or_else(|| addrs.next())
+        .ok_or_else(|| Error::explain(ErrorType::InternalError, format!("no address for {host}")))?;
+
+    // 3) 写回缓存（即便已过期也更新）
+    let cache = DNS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(host.to_string(), DnsCacheEntry { addr, ts: Instant::now() });
+    }
+
+    Ok(addr)
+}
 
 #[derive(Clone)]
 pub struct ProxyConfig {
@@ -185,8 +231,11 @@ impl ProxyHttp for IptvProxy {
         let port = target.port().unwrap_or(if target.scheme() == "https" { 443 } else { 80 });
         let is_https = target.scheme() == "https";
 
-        debug!("Upstream: {}:{} (TLS: {})", host, port, is_https);
-        Ok(Box::new(HttpPeer::new((host.clone(), port), is_https, host)))
+        // 解析为 IPv4 优先地址，避免连 IPv6 上游超时（家庭网络常见），并带 DNS 缓存
+        let addr = resolve_upstream_addr(&host, port).await?;
+
+        debug!("Upstream: {} ({}) TLS: {}", addr, host, is_https);
+        Ok(Box::new(HttpPeer::new(addr, is_https, host)))
     }
 
     async fn upstream_request_filter(&self, session: &mut Session, upstream_request: &mut RequestHeader, ctx: &mut Self::CTX) -> Result<()> {
@@ -428,7 +477,7 @@ fn main() {
     }
     let local_ip = local_ip
         .or_else(|| std::env::var("LOCAL_IP").ok())
-        .unwrap_or_else(|| "192.168.1.1".to_string());
+        .unwrap_or_else(|| "192.168.1.3".to_string());
 
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let bind_port: u16 = bind_addr.split(':').nth(1).and_then(|p| p.parse().ok()).unwrap_or(8080);
