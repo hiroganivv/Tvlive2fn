@@ -455,7 +455,21 @@ impl ProxyHttp for IptvProxy {
         let status = session.response_written().map(|r| r.status.as_u16()).unwrap_or(0);
         let client = session.client_addr().map(|a| a.to_string()).unwrap_or_else(|| "unknown".into());
         if let Some(err) = e {
-            error!("{} {} {} - Status:{} Error:{:?}", client, req.method, req.uri.path(), status, err);
+            // 客户端主动断连（下游写入/读取失败、连接关闭）属正常现象（播放器停止、
+            // 读完列表即关连接、或客户端超时先 RST），降级为 debug 以免刷屏并误判为故障。
+            let client_abort = err.esource == ErrorSource::Downstream
+                && matches!(
+                    err.etype,
+                    ErrorType::WriteError | ErrorType::ReadError | ErrorType::ConnectionClosed
+                );
+            if client_abort {
+                debug!(
+                    "{} {} {} - client disconnected (Status:{}): {}",
+                    client, req.method, req.uri.path(), status, err
+                );
+            } else {
+                error!("{} {} {} - Status:{} Error:{:?}", client, req.method, req.uri.path(), status, err);
+            }
         } else {
             debug!("{} {} {} - Status:{}", client, req.method, req.uri.path(), status);
         }
