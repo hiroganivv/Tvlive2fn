@@ -181,6 +181,32 @@ impl ProxyHttp for IptvProxy {
             let mut url = url::Url::parse(&decoded_str)
                 .map_err(|e| Error::explain(ErrorType::HTTPStatus(400), format!("invalid URL: {e}")))?;
 
+            // 校验目标 host：必须存在且为合法 FQDN/IP（含 "."），拒绝裸主机名（如 "sur"），
+            // 既避免无谓的 DNS 查询与 500 错误刷屏，也挡掉扫描器的垃圾请求。
+            let host = url.host_str().unwrap_or("").to_string();
+            if host.is_empty() || !host.contains('.') {
+                return Err(Error::explain(ErrorType::HTTPStatus(400), "invalid target host"));
+            }
+
+            // 可选上游白名单（SSRF 防护）：ALLOW_HOSTS=surrit.com,fourhoi.com
+            // 设置后仅放行列表内域名（含其子域）；未设置则保持开放行为。
+            if let Some(allow_list) = std::env::var("ALLOW_HOSTS").ok() {
+                let allowed: Vec<String> = allow_list
+                    .split(',')
+                    .map(|s| s.trim().to_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !allowed.is_empty() {
+                    let host_l = host.to_lowercase();
+                    let permitted = allowed
+                        .iter()
+                        .any(|a| host_l == *a || host_l.ends_with(&format!(".{}", a)));
+                    if !permitted {
+                        return Err(Error::explain(ErrorType::HTTPStatus(403), "host not allowed by ALLOW_HOSTS"));
+                    }
+                }
+            }
+
             // 用 path() 判断 m3u8/m3u，避免查询参数干扰
             ctx.is_m3u8 = url.path().ends_with(".m3u8") || url.path().ends_with(".m3u");
 
@@ -462,9 +488,11 @@ impl ProxyHttp for IptvProxy {
                     err.etype,
                     ErrorType::WriteError | ErrorType::ReadError | ErrorType::ConnectionClosed
                 );
-            if client_abort {
+            // 4xx 是客户端问题（非法请求 / 不在白名单的扫描器），并非服务故障，降级为 debug 避免刷屏
+            let client_error = matches!(err.etype, ErrorType::HTTPStatus(_));
+            if client_abort || client_error {
                 debug!(
-                    "{} {} {} - client disconnected (Status:{}): {}",
+                    "{} {} {} - client-side (Status:{}): {}",
                     client, req.method, req.uri.path(), status, err
                 );
             } else {
