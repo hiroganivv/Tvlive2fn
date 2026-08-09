@@ -428,7 +428,7 @@ fn main() {
     }
     let local_ip = local_ip
         .or_else(|| std::env::var("LOCAL_IP").ok())
-        .unwrap_or_else(|| "192.168.1.3".to_string());
+        .unwrap_or_else(|| "192.168.1.1".to_string());
 
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let bind_port: u16 = bind_addr.split(':').nth(1).and_then(|p| p.parse().ok()).unwrap_or(8080);
