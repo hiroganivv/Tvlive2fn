@@ -298,6 +298,15 @@ impl ProxyHttp for IptvProxy {
         ProxyContext::new()
     }
 
+    // 上游连接失败/超时（连接建立、TLS 握手、无响应等）时自动重试 1 次。
+    // 代理的请求全部是幂等 GET（m3u8 / TS 分片 / 密钥），重试安全。
+    // 播放器请求分片时常因上游首次握手慢而超时 abort（表现为日志里的
+    // Downstream ConnectionClosed、以及"要多次点击播放才能播"），
+    // 由代理自行重试后，播放器无需再手动重连。
+    fn retries(&self, _ctx: &Self::CTX) -> usize {
+        1
+    }
+
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
         let req = session.req_header();
         let path = req.uri.path();
@@ -413,15 +422,16 @@ impl ProxyHttp for IptvProxy {
         let addr = resolve_upstream_addr(&host, port).await?;
 
         let mut peer = HttpPeer::new(addr, is_https, host.clone());
-        // 上游连接调优：
+        // 上游连接调优（针对播放器"请求分片时提前断开 / 需多次点击才能播放"问题）：
+        // - connection_timeout / total_connection_timeout 收紧：上游慢时快速失败，
+        //   配合下方 retries() 自动重试，让代理在播放器超时 abort 之前就完成连接或失败重试，
+        //   避免播放器干等后主动 RST（即日志里的 Downstream ConnectionClosed）。
         // - idle_timeout 拉长：让建好的 TLS 连接在连接池里多活一会儿，减少 web 播放器
         //   频繁 abort / 并发取段时反复做 TLS 握手（~0.5-1s）造成的卡顿。
-        // - connection_timeout / total_connection_timeout 缩短：上游慢时快速失败，
-        //   而不是让客户端（web 播放器）一直干等后超时重连，放大卡顿。
-        peer.options.connection_timeout = Some(Duration::from_secs(3));
-        peer.options.total_connection_timeout = Some(Duration::from_secs(8));
+        peer.options.connection_timeout = Some(Duration::from_secs(2));
+        peer.options.total_connection_timeout = Some(Duration::from_secs(5));
         peer.options.idle_timeout = Some(Duration::from_secs(60));
-        peer.options.read_timeout = Some(Duration::from_secs(20));
+        peer.options.read_timeout = Some(Duration::from_secs(15));
 
         debug!("Upstream: {} ({}) TLS: {}", addr, host, is_https);
         Ok(Box::new(peer))
@@ -608,11 +618,26 @@ impl ProxyHttp for IptvProxy {
         Ok(None)
     }
 
-    async fn logging(&self, session: &mut Session, e: Option<&Error>, _ctx: &mut Self::CTX) {
+    async fn logging(&self, session: &mut Session, e: Option<&Error>, ctx: &mut Self::CTX) {
         let req = session.req_header();
         let status = session.response_written().map(|r| r.status.as_u16()).unwrap_or(0);
         let client = session.client_addr().map(|a| a.to_string()).unwrap_or_else(|| "unknown".into());
         if let Some(err) = e {
+            // 上游连接建立失败/超时：立即清除对应 DNS 缓存条目，下次重试会重新解析，
+            // 避免一个失效 IP 被缓存 5 分钟导致同一分片反复连接失败（"多次点击才播得出来"）。
+            if err.esource == ErrorSource::Upstream
+                && matches!(err.etype, ErrorType::ConnectError | ErrorType::ConnectTimeout)
+            {
+                if let Some(host) = ctx.target_url.as_ref().and_then(|u| u.host_str()) {
+                    if let Some(cache) = DNS_CACHE.get() {
+                        if let Ok(mut g) = cache.lock() {
+                            if g.remove(host).is_some() {
+                                debug!("DNS cache invalidated for {host}");
+                            }
+                        }
+                    }
+                }
+            }
             // 客户端主动断连（下游写入/读取失败、连接关闭）属正常现象（播放器停止、
             // 读完列表即关连接、或客户端超时先 RST），降级为 debug 以免刷屏并误判为故障。
             let client_abort = err.esource == ErrorSource::Downstream
@@ -673,7 +698,7 @@ fn main() {
             None
         }
     };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,pingora_proxy=warn"))
         .format_timestamp_millis()
         .target(env_logger::Target::Pipe(Box::new(DualWriter { file: log_file })))
         .init();
