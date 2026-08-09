@@ -16,6 +16,10 @@ use std::time::{Duration, Instant};
 const DEFAULT_REFERER: &str = "https://missav.ws/dm242/cn";
 const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
+/// 代码内置默认放行域名（含其子域），始终允许；与 ALLOW_HOSTS 环境变量取并集，
+/// 确保即便设置了上游白名单，surrit.com 这类核心源站也不会被误挡。
+const DEFAULT_ALLOW_HOSTS: &[&str] = &["surrit.com"];
+
 /// 上游 DNS 解析缓存：强制优先 IPv4，避免家庭网络下连 IPv6 上游超时；
 /// 缓存带 TTL（5 分钟），避免每个 .ts 分片都重复做 DNS 查询。
 struct DnsCacheEntry {
@@ -100,6 +104,19 @@ impl ProxyContext {
     }
 }
 
+/// 直接回写一段简单错误响应并视作"请求已处理"，以避免 request_filter 返回 Err 时
+/// Pingora 内部打印 `Fail to filter request` 的 ERROR 日志（扫描器洪水会刷屏）。
+/// 写入失败（多为客户端已断开）直接忽略，返回 Ok(true)。
+async fn respond_client_error(session: &mut Session, status: u16, msg: &str) -> Result<bool> {
+    if let Ok(mut resp) = ResponseHeader::build(status, None) {
+        let _ = resp.insert_header("Content-Type", "text/plain; charset=utf-8");
+        let _ = resp.insert_header("Connection", "close");
+        let _ = session.write_response_header(Box::new(resp), false).await;
+        let _ = session.write_response_body(Some(Bytes::from(msg.to_string())), true).await;
+    }
+    Ok(true)
+}
+
 pub struct IptvProxy {
     config: ProxyConfig,
 }
@@ -173,38 +190,44 @@ impl ProxyHttp for IptvProxy {
 
         if let Some(url_param) = query.split('&').find(|p| p.starts_with("url=")) {
             let encoded = &url_param[4..];
-            let decoded = urlencoding::decode(encoded)
-                .map_err(|e| Error::explain(ErrorType::HTTPStatus(400), format!("decode: {e}")))?;
+            let decoded = match urlencoding::decode(encoded) {
+                Ok(d) => d,
+                Err(_) => return respond_client_error(session, 400, "Bad Request").await,
+            };
             let decoded_str = decoded.to_string();
             debug!("Decoded URL: {}", decoded_str);
 
-            let mut url = url::Url::parse(&decoded_str)
-                .map_err(|e| Error::explain(ErrorType::HTTPStatus(400), format!("invalid URL: {e}")))?;
+            let mut url = match url::Url::parse(&decoded_str) {
+                Ok(u) => u,
+                Err(_) => return respond_client_error(session, 400, "Bad Request").await,
+            };
 
             // 校验目标 host：必须存在且为合法 FQDN/IP（含 "."、且不以 "." 结尾），
             // 拒绝裸主机名（如 "sur"）或畸形主机名（如 "surrit."），
             // 既避免无谓的 DNS 查询与 500 错误刷屏，也挡掉扫描器的垃圾请求。
             let host = url.host_str().unwrap_or("").to_string();
             if host.is_empty() || !host.contains('.') || host.ends_with('.') {
-                return Err(Error::explain(ErrorType::HTTPStatus(400), "invalid target host"));
+                return respond_client_error(session, 400, "Bad Request").await;
             }
 
-            // 可选上游白名单（SSRF 防护）：ALLOW_HOSTS=surrit.com,fourhoi.com
-            // 设置后仅放行列表内域名（含其子域）；未设置则保持开放行为。
+            // 内置默认放行 + 可选环境变量白名单（SSRF 防护）：
+            // DEFAULT_ALLOW_HOSTS（surrit.com 及其子域）始终允许；
+            // 仅当设置了 ALLOW_HOSTS 才进入白名单模式（二者取并集，非列表域名返回 403）；
+            // 未设置 ALLOW_HOSTS 时保持开放（仅做 host 合法性校验，不做域名白名单限制）。
+            let mut allowed: Vec<String> = DEFAULT_ALLOW_HOSTS.iter().map(|s| s.to_lowercase()).collect();
             if let Some(allow_list) = std::env::var("ALLOW_HOSTS").ok() {
-                let allowed: Vec<String> = allow_list
-                    .split(',')
-                    .map(|s| s.trim().to_lowercase())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                if !allowed.is_empty() {
-                    let host_l = host.to_lowercase();
-                    let permitted = allowed
-                        .iter()
-                        .any(|a| host_l == *a || host_l.ends_with(&format!(".{}", a)));
-                    if !permitted {
-                        return Err(Error::explain(ErrorType::HTTPStatus(403), "host not allowed by ALLOW_HOSTS"));
-                    }
+                allowed.extend(
+                    allow_list
+                        .split(',')
+                        .map(|s| s.trim().to_lowercase())
+                        .filter(|s| !s.is_empty()),
+                );
+                let host_l = host.to_lowercase();
+                let permitted = allowed
+                    .iter()
+                    .any(|a| host_l == *a || host_l.ends_with(&format!(".{}", a)));
+                if !permitted {
+                    return respond_client_error(session, 403, "Forbidden").await;
                 }
             }
 
@@ -247,7 +270,7 @@ impl ProxyHttp for IptvProxy {
             return Ok(false);
         }
 
-        Err(Error::explain(ErrorType::HTTPStatus(400), "Use /?url=<encoded_target>"))
+        respond_client_error(session, 400, "Use /?url=<encoded_target>").await
     }
 
     async fn upstream_peer(&self, _session: &mut Session, ctx: &mut Self::CTX) -> Result<Box<HttpPeer>> {
