@@ -1,10 +1,10 @@
 #!/bin/bash
 set -e
 
-TARGET_HOST="192.168.1.3"
+TARGET_HOST="192.168.1.1"
 TARGET_USER="root"
 TARGET_PASS="password"
-LOCAL_IP="192.168.1.3"
+LOCAL_IP="192.168.1.1"
 
 echo "========================================="
 echo "IPTV Proxy - OpenWrt Deployment"
@@ -79,7 +79,7 @@ USE_PROCD=1
 
 start_service() {
     procd_open_instance
-    procd_set_param command /usr/bin/iptv-proxy
+    procd_set_param command /usr/bin/iptv-proxy -Li ${LOCAL_IP}
     procd_set_param env LOCAL_IP="${LOCAL_IP}"
     procd_set_param env BIND_ADDR="0.0.0.0:8080"
     procd_set_param env RUST_LOG="info"
