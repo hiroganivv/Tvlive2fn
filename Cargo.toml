@@ -9,7 +9,7 @@ authors = ["IPTV Proxy Team"]
 pingora = { git = "https://github.com/cloudflare/pingora", rev = "d9e6d7a", default-features = false, features = ["lb", "rustls"] }
 pingora-core = { git = "https://github.com/cloudflare/pingora", rev = "d9e6d7a", default-features = false }
 async-trait = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net"] }
 bytes = "1"
 url = "2"
 log = "0.4"
