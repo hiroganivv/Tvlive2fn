@@ -10,8 +10,12 @@ description = "IPTV transparent proxy (m3u8 rewrite + media passthrough) built o
 axum = "0.7"
 # 异步运行时
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }
-# 上游 HTTP 客户端：rustls 静态链接（无 openssl）、stream 用于分片流式转发、http2 上游兼容
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "http2"] }
+# 上游 HTTP 客户端：stream 用于分片流式转发、http2 上游兼容。
+# TLS 后端按目标区分（见下方 target 段）：
+#  - Windows 用 native-tls(schannel)：直接信任 Windows 系统证书库，能过公司/运营商的 TLS 拦截证书，
+#    且无需 C 编译器即可在本机编译；
+#  - 非 Windows(musl/Linux) 用 rustls-tls：CI 容器自带 gcc，静态链接无 openssl 依赖。
+reqwest = { version = "0.12", default-features = false }
 # 缓冲
 bytes = "1"
 # HTTP 类型（axum / reqwest 共用 http crate）
@@ -30,3 +34,10 @@ lto = "fat"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# ── 按目标选择 TLS 后端 ─────────────────────────────────────────────────────
+[target.'cfg(windows)'.dependencies.reqwest]
+features = ["native-tls", "stream", "http2"]
+
+[target.'cfg(not(windows))'.dependencies.reqwest]
+features = ["rustls-tls", "stream", "http2"]
