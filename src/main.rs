@@ -13,7 +13,7 @@ use axum::Router;
 use http::header::{HeaderName, HeaderValue, ACCEPT, ACCEPT_ENCODING, HOST, REFERER, USER_AGENT};
 use http::HeaderMap;
 use reqwest::dns::{Name, Resolve};
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 use tracing_subscriber::fmt::writer::MakeWriter;
 use url::Url;
 
@@ -304,6 +304,7 @@ async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) -> Res
         Ok(d) => d.to_string(),
         Err(_) => return client_error(400, "Bad Request"),
     };
+    debug!("Proxy request: {}", decoded);
     let mut url = match Url::parse(&decoded) {
         Ok(u) => u,
         Err(_) => return client_error(400, "Bad Request"),
@@ -400,11 +401,9 @@ async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) -> Res
     let resp = match send_once().await {
         Ok(r) => r,
         Err(e) => {
-            debug!("Upstream connect failed: {e}, retrying once");
-            match send_once().await {
-                Ok(r) => r,
-                Err(_) => return client_error(502, "Bad Gateway"),
-            }
+            error!("Upstream request failed for {}: {}", decoded, e);
+            let msg = format!("Bad Gateway: {e}");
+            return client_error(502, &msg);
         }
     };
 
@@ -460,7 +459,11 @@ async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) -> Res
                 }
                 return builder.body(Body::from(rewritten)).unwrap();
             }
-            Err(_) => return client_error(502, "Bad Gateway"),
+            Err(e) => {
+                error!("Failed to read upstream body for {}: {}", decoded, e);
+                let msg = format!("Bad Gateway: {e}");
+                return client_error(502, &msg);
+            }
         }
     }
 
