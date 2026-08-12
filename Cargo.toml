@@ -36,8 +36,10 @@ strip = true
 panic = "abort"
 
 # ── 按目标选择 TLS 后端 ─────────────────────────────────────────────────────
-[target.'cfg(windows)'.dependencies.reqwest]
-features = ["native-tls", "stream", "http2"]
+# Windows：native-tls(schannel)，直接信任 Windows 系统证书库，无需 C 编译器
+[target.'cfg(windows)'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["native-tls", "stream", "http2"] }
 
-[target.'cfg(not(windows))'.dependencies.reqwest]
-features = ["rustls-tls", "stream", "http2"]
+# 非 Windows（musl/Linux）：rustls-tls 静态链接，无 openssl 依赖
+[target.'cfg(not(windows))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "http2"] }
