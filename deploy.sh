@@ -44,10 +44,10 @@ REMOTE
 echo ""
 echo "=== 4. 测试 ==="
 sleep 2
-curl -s "http://192.168.1.166:8080/iptv/http://116.199.7.27:8006/00000000/1d77ac8593854801b7503a85270ee7b9/index.m3u8" | head -10
+curl -s "http://192.168.1.166:8080/?url=http%3A%2F%2F116.199.7.27%3A8006%2F00000000%2F1d77ac8593854801b7503a85270ee7b9%2Findex.m3u8" | head -10
 
 echo ""
 echo "✅ 部署完成！"
 echo ""
 echo "播放地址："
-echo "  http://192.168.1.166:8080/iptv/http://116.199.7.27:8006/xxx/index.m3u8"
+echo "  http://192.168.1.166:8080/?url=http%3A%2F%2F116.199.7.27%3A8006%2Fxxx%2Findex.m3u8"
