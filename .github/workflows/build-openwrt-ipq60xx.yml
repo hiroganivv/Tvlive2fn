@@ -1,0 +1,199 @@
+name: Build IPTV Proxy for OpenWrt IPQ60xx
+
+on:
+  push:
+    branches: [ main, master ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: Build for OpenWrt IPQ60xx (aarch64_cortex-a53)
+    runs-on: ubuntu-latest
+    container:
+      image: messense/rust-musl-cross:aarch64-musl
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Build for aarch64-unknown-linux-musl
+      run: cargo build --release --target aarch64-unknown-linux-musl -vv
+
+    - name: Check binary info
+      run: |
+        file target/aarch64-unknown-linux-musl/release/iptv-proxy
+        du -h target/aarch64-unknown-linux-musl/release/iptv-proxy
+
+    - name: Create OpenWrt installation package
+      run: |
+        mkdir -p openwrt-package/usr/bin
+        mkdir -p openwrt-package/etc/init.d
+        cp target/aarch64-unknown-linux-musl/release/iptv-proxy \
+           openwrt-package/usr/bin/
+        cat > openwrt-package/etc/init.d/iptv-proxy << 'EOF'
+        #!/bin/sh /etc/rc.common
+        START=99
+        STOP=10
+        USE_PROCD=1
+        start_service() {
+            procd_open_instance
+            procd_set_param command /usr/bin/iptv-proxy -Li 192.168.1.1
+            procd_set_param env LOCAL_IP="192.168.1.1"
+            procd_set_param env BIND_ADDR="0.0.0.0:8080"
+            procd_set_param env RUST_LOG="info"
+            procd_set_param env WORKERS="4"
+            procd_set_param respawn 3600 5 5
+            procd_set_param stdout 1
+            procd_set_param stderr 1
+            procd_set_param limits nofile="65535 65535"
+            procd_close_instance
+        }
+        EOF
+        chmod +x openwrt-package/etc/init.d/iptv-proxy
+        cat > openwrt-package/install.sh << 'EOF'
+        #!/bin/sh
+        echo "Installing IPTV Proxy for OpenWrt..."
+        cp usr/bin/iptv-proxy /usr/bin/
+        chmod +x /usr/bin/iptv-proxy
+        cp etc/init.d/iptv-proxy /etc/init.d/
+        chmod +x /etc/init.d/iptv-proxy
+        /etc/init.d/iptv-proxy enable
+        /etc/init.d/iptv-proxy start
+        echo "Installation complete!"
+        EOF
+        chmod +x openwrt-package/install.sh
+        cat > openwrt-package/README.md << 'EOF'
+        # IPTV Proxy for OpenWrt IPQ60xx
+        ## Installation
+        1. Upload to OpenWrt:
+           scp -r openwrt-package root@192.168.1.1:/tmp/
+        2. Install:
+           ssh root@192.168.1.1
+           cd /tmp/openwrt-package
+           sh install.sh
+        3. Configure (optional):
+           Edit /etc/init.d/iptv-proxy to change LOCAL_IP
+        4. Check status:
+           /etc/init.d/iptv-proxy status
+           logread | grep iptv-proxy
+        ## Usage
+        http://192.168.1.1:8080/?url=http%3A%2F%2F116.199.x.x%2Fpath%2Ffile.m3u8
+        EOF
+        tar czf iptv-proxy-openwrt-ipq60xx.tar.gz openwrt-package/
+        ls -lh iptv-proxy-openwrt-ipq60xx.tar.gz
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: iptv-proxy-openwrt-ipq60xx
+        path: |
+          target/aarch64-unknown-linux-musl/release/iptv-proxy
+          iptv-proxy-openwrt-ipq60xx.tar.gz
+        retention-days: 30
+
+    - name: Create Release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          iptv-proxy-openwrt-ipq60xx.tar.gz
+          target/aarch64-unknown-linux-musl/release/iptv-proxy
+        body: |
+          ## IPTV Proxy for OpenWrt IPQ60xx
+          **Target**: aarch64_cortex-a53 (IPQ6018/IPQ6010/IPQ6000)
+          **Architecture**: Static-linked musl binary
+          ### Quick Install
+          ```bash
+          wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/iptv-proxy-openwrt-ipq60xx.tar.gz
+          tar xzf iptv-proxy-openwrt-ipq60xx.tar.gz
+          scp -r openwrt-package root@192.168.1.1:/tmp/
+          ssh root@192.168.1.1 "cd /tmp/openwrt-package && sh install.sh"
+
+  build-windows:
+    name: Build for Windows (x86_64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Build for Windows (x86_64-pc-windows-msvc)
+      run: cargo build --release -vv
+
+    - name: Check binary info
+      run: |
+        ls -lh target/release/iptv-proxy.exe
+
+    - name: Create Windows package
+      run: |
+        mkdir -p windows-package
+        cp target/release/iptv-proxy.exe windows-package/
+        cat > windows-package/README.md << 'EOF'
+        # IPTV Proxy for Windows (x86_64)
+
+        ## Run
+        1. Open a terminal in this folder.
+        2. Start the proxy (replace the IP with your LAN IP):
+           iptv-proxy.exe -Li 192.168.1.100
+        3. The proxy listens on 0.0.0.0:8080 by default.
+
+        ## Playlist / player URL format
+        http://<this-pc-ip>:8080/?url=<percent-encoded target URL>
+
+        Example:
+        http://192.168.1.100:8080/?url=http%3A%2F%2F116.199.x.x%2Fpath%2Ffile.m3u8
+
+        ## Useful environment variables
+        LOCAL_IP       Override the advertised local IP (same as -Li).
+        BIND_ADDR      Bind address, e.g. 127.0.0.1:8080 (default 0.0.0.0:8080).
+        WORKERS        Number of worker threads (default: CPU cores).
+        RUST_LOG       Log level: error | warn | info | debug (default info).
+        LOG_FILE       Path to append logs (logs also go to stderr).
+        ALLOW_HOSTS    Comma-separated upstream host whitelist (SSRF guard).
+        ALLOW_PRIVATE  Set to 1 to permit private/loopback upstream IPs.
+        PROXY_BASE     Override the generated proxy base URL (domain / https).
+        DEFAULT_REFERER Referer injected when the upstream omits one.
+        DEFAULT_UA     User-Agent sent to upstreams.
+        EOF
+        powershell -NoProfile -Command "Compress-Archive -Path windows-package/* -DestinationPath iptv-proxy-windows-x86_64.zip -Force"
+        ls -lh iptv-proxy-windows-x86_64.zip
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: iptv-proxy-windows-x86_64
+        path: |
+          target/release/iptv-proxy.exe
+          iptv-proxy-windows-x86_64.zip
+        retention-days: 30
+
+    - name: Create Release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          iptv-proxy-windows-x86_64.zip
+          target/release/iptv-proxy.exe
+        body: |
+          ## IPTV Proxy for Windows (x86_64)
+          **Target**: x86_64-pc-windows-msvc
+          ### Run
+          ```powershell
+          .\iptv-proxy.exe -Li 192.168.1.100
+          # Then open in your player:
+          # http://192.168.1.100:8080/?url=<encoded target>
+          ```
