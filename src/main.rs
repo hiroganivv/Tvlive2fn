@@ -266,6 +266,19 @@ fn client_error(status: u16, msg: &str) -> Response {
         .unwrap()
 }
 
+/// 把错误及其所有 source() 链拼成可读字符串，便于定位真实根因（DNS 解析 / 连接超时 / TLS / 代理 / 403 等）。
+/// 顶层 `error sending request` 只是 reqwest 的包装，真正的失败原因藏在 `.source()` 里。
+fn full_err(e: &dyn std::error::Error) -> String {
+    let mut s = e.to_string();
+    let mut src = e.source();
+    while let Some(c) = src {
+        s.push_str(" → ");
+        s.push_str(&c.to_string());
+        src = c.source();
+    }
+    s
+}
+
 /// 是否为需要转发的客户端请求头
 fn forward_headers(req: &HeaderMap, name: &str) -> Option<HeaderValue> {
     req.get(HeaderName::from_bytes(name.as_bytes()).ok()?).cloned()
@@ -401,8 +414,8 @@ async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) -> Res
     let resp = match send_once().await {
         Ok(r) => r,
         Err(e) => {
-            error!("Upstream request failed for {}: {}", decoded, e);
-            let msg = format!("Bad Gateway: {e}");
+            error!("Upstream request failed for {}: {}", decoded, full_err(&e));
+            let msg = format!("Bad Gateway: {}", full_err(&e));
             return client_error(502, &msg);
         }
     };
@@ -460,8 +473,8 @@ async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) -> Res
                 return builder.body(Body::from(rewritten)).unwrap();
             }
             Err(e) => {
-                error!("Failed to read upstream body for {}: {}", decoded, e);
-                let msg = format!("Bad Gateway: {e}");
+                error!("Failed to read upstream body for {}: {}", decoded, full_err(&e));
+                let msg = format!("Bad Gateway: {}", full_err(&e));
                 return client_error(502, &msg);
             }
         }
@@ -503,6 +516,83 @@ fn is_global_ip(ip: std::net::IpAddr) -> bool {
 /// 私有地址是否允许（allow_private 时放行，与解析器默认行为一致）
 fn state_is_private_ok(state: &AppState, ip: std::net::IpAddr) -> bool {
     state.allow_private || is_global_ip(ip)
+}
+
+// ── Windows 系统代理自动探测 ─────────────────────────────────────────────────
+// reqwest 默认会读 HTTPS_PROXY/HTTP_PROXY/ALL_PROXY 环境变量作为出口代理，但**不会**读 Windows 的
+// IE/Internet Settings(WinINet) 代理——后者只存在于注册表。而 curl / 浏览器会自动读 WinINet，
+// 这就造成"curl 能连、reqwest 连不上"的差异。本函数在 Windows 上把 WinINet 代理写入环境变量，
+// 行为即可与浏览器/curl 对齐。任何解析失败都静默忽略（回退直连）。
+#[cfg(windows)]
+fn apply_windows_system_proxy() {
+    if std::env::var("HTTPS_PROXY").is_ok()
+        || std::env::var("HTTP_PROXY").is_ok()
+        || std::env::var("ALL_PROXY").is_ok()
+    {
+        info!("代理环境变量已设置，跳过 Windows WinINet 自动探测");
+        return;
+    }
+    let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+    let enabled = std::process::Command::new("reg")
+        .args(["query", key, "/v", "ProxyEnable"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("0x1"))
+        .unwrap_or(false);
+    if !enabled {
+        return;
+    }
+    let server = std::process::Command::new("reg")
+        .args(["query", key, "/v", "ProxyServer"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout);
+            s.split("ProxyServer")
+                .nth(1)
+                .and_then(|r| r.split("REG_SZ").nth(1))
+                .map(|v| v.trim().to_string())
+        })
+        .unwrap_or_default();
+    if server.is_empty() {
+        return;
+    }
+    let (http_p, https_p) = parse_ie_proxy(&server);
+    if !http_p.is_empty() {
+        let _ = std::env::set_var("HTTP_PROXY", &http_p);
+    }
+    if !https_p.is_empty() {
+        let _ = std::env::set_var("HTTPS_PROXY", &https_p);
+    }
+    info!(
+        "已应用 Windows 系统代理(来自 IE 设置)：http={} https={}",
+        http_p, https_p
+    );
+}
+
+#[cfg(windows)]
+fn parse_ie_proxy(server: &str) -> (String, String) {
+    if server.contains('=') {
+        let mut http = String::new();
+        let mut https = String::new();
+        for part in server.split(';') {
+            if let Some((k, v)) = part.split_once('=') {
+                match k.trim().to_ascii_lowercase().as_str() {
+                    "http" => http = v.trim().to_string(),
+                    "https" => https = v.trim().to_string(),
+                    _ => {}
+                }
+            }
+        }
+        if https.is_empty() {
+            https = http.clone();
+        }
+        if http.is_empty() {
+            http = https.clone();
+        }
+        (http, https)
+    } else {
+        (server.to_string(), server.to_string())
+    }
 }
 
 // ── 日志双写（stderr + 文件）────────────────────────────────────────────────
@@ -613,6 +703,12 @@ fn main() {
     });
 
     // 解析器 + 客户端（IPv4 优先、仅全局地址、连接级 failover、连接池复用）
+    #[cfg(windows)]
+    apply_windows_system_proxy();
+    if let Ok(p) = std::env::var("HTTPS_PROXY").or_else(|_| std::env::var("HTTP_PROXY")) {
+        info!("上游出口代理：{}", p);
+    }
+
     let resolver = Arc::new(Ipv4Resolver {
         cache: Arc::new(Mutex::new(HashMap::new())),
         allow_private,
