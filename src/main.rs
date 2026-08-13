@@ -64,7 +64,10 @@ impl Resolve for Ipv4Resolver {
             }
 
             // 2) 解析：lookup_host 同时返回 A 与 AAAA，仅保留 IPv4 且（默认）仅全局地址
-            let addrs_iter = tokio::net::lookup_host(host)
+            //    注意：必须用 (host, 0u16) 元组形式，与 hyper 默认 GaiResolver 一致。
+            //    裸主机名字符串 "surrit.com" 会被 std 当成 SocketAddr 去 parse 而报
+            //    "invalid socket address" 错误，不会回退到 DNS 解析。
+            let addrs_iter = tokio::net::lookup_host((host, 0u16))
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
