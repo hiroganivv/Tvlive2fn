@@ -10,7 +10,7 @@ use axum::extract::State;
 use axum::http::{Method, Request};
 use axum::response::Response;
 use axum::Router;
-use http::header::{HeaderName, HeaderValue, ACCEPT, ACCEPT_ENCODING, HOST, REFERER, USER_AGENT};
+use http::header::{HeaderName, HeaderValue, ACCEPT, ACCEPT_ENCODING, HOST, ORIGIN, REFERER, USER_AGENT};
 use http::HeaderMap;
 use reqwest::dns::{Name, Resolve};
 use tracing::{debug, error, info};
@@ -379,29 +379,41 @@ async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) -> Res
     // 构造上游请求头
     let mut hmap = HeaderMap::new();
     hmap.insert(HOST, hv(&authority));
-    // UA：优先客户端，否则默认
-    let ua = headers
-        .get(USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| state.default_ua.clone());
-    hmap.insert(USER_AGENT, hv(&ua));
-    // Referer：优先客户端，否则默认
+    // Referer：优先客户端，否则默认（surrit.com 的 Cloudflare 以该 Referer 作为白名单放行热链）
     let referer = headers
         .get(REFERER)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
         .unwrap_or_else(|| state.default_referer.clone());
-    hmap.insert(REFERER, hv(&referer));
-    // 转发其它可能需要的头
-    for h in ["origin", "cookie", "authorization", "x-forwarded-for"] {
+    if !referer.is_empty() {
+        hmap.insert(REFERER, hv(&referer));
+    }
+    // UA：强制注入浏览器 UA（不继承客户端 curl/播放器的 UA，避免被 Cloudflare Bot Management 标记为自动化）。
+    // 原项目即采用"强制注入默认 UA"的方式通过源站，这里保持一致；可用 DEFAULT_UA 覆盖。
+    hmap.insert(USER_AGENT, hv(&state.default_ua));
+    // Origin：与 Referer 同源（模拟 missav.ws 嵌入 surrit.com 视频的请求场景，匹配 Cloudflare 白名单）
+    if let Ok(origin) = Url::parse(&referer).map(|u| {
+        let host = u.host_str().unwrap_or("");
+        format!("{}://{}", u.scheme(), host)
+    }) {
+        if origin.contains("://") && !origin.ends_with("://") {
+            hmap.insert(ORIGIN, hv(&origin));
+        }
+    }
+    // 转发 Cookie / Authorization / X-Forwarded-For（携带 cf_clearance 等可帮助通过挑战；客户端未带则为空跳过）
+    for h in ["cookie", "authorization", "x-forwarded-for"] {
         if let Some(v) = forward_headers(&headers, h) {
             if let Ok(name) = HeaderName::from_bytes(h.as_bytes()) {
                 hmap.insert(name, v);
             }
         }
     }
-    hmap.insert(ACCEPT, hv("*/*"));
+    // 浏览器式 Accept / Accept-Language，降低被 Bot Management 挑战概率
+    hmap.insert(
+        ACCEPT,
+        hv("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"),
+    );
+    hmap.insert(http::header::ACCEPT_LANGUAGE, hv("en-US,en;q=0.9"));
     if is_m3u8 {
         // 强制上游返回未压缩文本，便于整段缓冲改写
         hmap.insert(ACCEPT_ENCODING, hv("identity"));
