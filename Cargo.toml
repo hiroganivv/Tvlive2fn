@@ -22,7 +22,10 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
-panic = "abort"
+# 注意：不要使用 panic = "abort"。
+# 一旦某个请求的过滤器发生 panic，进程会直接中止，导致所有下游连接瞬间断开，
+# 在日志中表现为大量 "Downstream ConnectionClosed ... Prematurely before response ... complete"。
+# 保持默认的 unwind：单个请求出错仅影响该连接，不影响其它客户端。
 
 [profile.release.package."*"]
 opt-level = 3 
