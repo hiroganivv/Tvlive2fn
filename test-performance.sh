@@ -31,11 +31,11 @@ echo ""
 echo "=== 2. 功能测试 ==="
 
 echo "测试m3u8代理..."
-m3u8_url="http://${TARGET_HOST}:${PORT}/?url=http%3A%2F%2F116.199.7.27%3A8006%2F00000000%2Ftest.m3u8"
+m3u8_url="http://${TARGET_HOST}:${PORT}/iptv/http://116.199.7.27:8006/00000000/test.m3u8"
 curl -s --max-time 5 "$m3u8_url" >/dev/null 2>&1 && echo "✅ M3U8 proxy works" || echo "⚠️  M3U8 timeout (需要真实流)"
 
 echo "测试URL改写..."
-result=$(curl -s "http://${TARGET_HOST}:${PORT}/?url=http%3A%2F%2Fexample.com%2Ftest.m3u8" 2>&1)
+result=$(curl -s "http://${TARGET_HOST}:${PORT}/iptv/http://example.com/test.m3u8" 2>&1)
 echo "✅ URL解析正常"
 
 echo ""
