@@ -358,13 +358,11 @@ impl ProxyHttp for IptvProxy {
         Ok(None)
     }
 
-    async fn error_observer(&self, _session: &mut Session, error: &Error, _ctx: &mut Self::CTX) {
-        // 下游（播放器/客户端）在响应尚未发送完时断开，是 IPTV 场景常见行为
-        // （切台、缓冲、网络抖动），并非服务端故障，按良性情况处理，避免误报。
+    fn suppress_error_log(&self, _session: &mut Session, error: &Error, _ctx: &mut Self::CTX) -> bool {
+        // 下游（播放器/客户端）在响应尚未发送完时断开是 IPTV 场景常见行为
+        // （切台、缓冲、网络抖动），并非服务端故障，抑制框架默认 ERROR 日志。
         let msg = format!("{:?}", error);
-        if msg.contains("Downstream") {
-            debug!("downstream closed early (benign client disconnect): {}", msg);
-        }
+        msg.contains("Downstream")
     }
 
     async fn logging(&self, session: &mut Session, e: Option<&Error>, _ctx: &mut Self::CTX) {
