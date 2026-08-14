@@ -358,7 +358,7 @@ impl ProxyHttp for IptvProxy {
         Ok(None)
     }
 
-    fn suppress_error_log(&self, _session: &mut Session, error: &Error, _ctx: &mut Self::CTX) -> bool {
+    fn suppress_error_log(&self, _session: &Session, _ctx: &Self::CTX, error: &Error) -> bool {
         // 下游（播放器/客户端）在响应尚未发送完时断开是 IPTV 场景常见行为
         // （切台、缓冲、网络抖动），并非服务端故障，抑制框架默认 ERROR 日志。
         let msg = format!("{:?}", error);
