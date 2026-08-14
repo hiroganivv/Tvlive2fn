@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::Uri;
-use log::{error, info};
+use log::{debug, error, info};
 use pingora::http::{RequestHeader, ResponseHeader};
 use pingora::prelude::*;
 use pingora::proxy::http_proxy_service;
@@ -277,8 +277,14 @@ impl ProxyHttp for IptvProxy {
                     Ok(s) => s.to_string(),
                     Err(_) => return Ok(None),
                 };
-                let base = ctx.base_url.as_ref().expect("base_url missing");
-                let origin_base = ctx.origin_base.as_ref().expect("origin_base missing");
+                let base = match ctx.base_url.as_ref() {
+                    Some(b) => b,
+                    None => return Ok(None),
+                };
+                let origin_base = match ctx.origin_base.as_ref() {
+                    Some(b) => b,
+                    None => return Ok(None),
+                };
                 let mut new_content = String::with_capacity(content.len());
                 let mut pending_tag: Option<String> = None;
 
@@ -352,14 +358,33 @@ impl ProxyHttp for IptvProxy {
         Ok(None)
     }
 
+    async fn error_observer(&self, _session: &mut Session, error: &Error, _ctx: &mut Self::CTX) {
+        // 下游（播放器/客户端）在响应尚未发送完时断开，是 IPTV 场景常见行为
+        // （切台、缓冲、网络抖动），并非服务端故障，按良性情况处理，避免误报。
+        let msg = format!("{:?}", error);
+        if msg.contains("Downstream") {
+            debug!("downstream closed early (benign client disconnect): {}", msg);
+        }
+    }
+
     async fn logging(&self, session: &mut Session, e: Option<&Error>, _ctx: &mut Self::CTX) {
         let req = session.req_header();
         let status = session.response_written().map(|r| r.status.as_u16()).unwrap_or(0);
         let client = session.client_addr().map(|a| a.to_string()).unwrap_or_else(|| "unknown".into());
-        if let Some(err) = e {
-            error!("{} {} {} - Status:{} Error:{:?}", client, req.method, req.uri.path(), status, err);
-        } else {
-            info!("{} {} {} - Status:{}", client, req.method, req.uri.path(), status);
+        match e {
+            Some(err) => {
+                let msg = format!("{:?}", err);
+                if msg.contains("Downstream") {
+                    // 客户端提前断开：良性事件，降级为 debug，不再污染错误日志
+                    debug!(
+                        "{} {} {} - Status:{} downstream closed early (benign)",
+                        client, req.method, req.uri.path(), status
+                    );
+                } else {
+                    error!("{} {} {} - Status:{} Error:{:?}", client, req.method, req.uri.path(), status, err);
+                }
+            }
+            None => info!("{} {} {} - Status:{}", client, req.method, req.uri.path(), status),
         }
     }
 }
